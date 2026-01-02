@@ -21,8 +21,24 @@ from aiohttp import ClientSession
 from aiohttp_socks import ProxyConnector
 from aiogram.methods import TelegramMethod # <--- ЭТА СТРОКА ДОЛЖНА БЫТЬ ДОБАВЛЕНА
 from aiogram.types import User 
-
+# В app.py, добавьте эти импорты (если их нет)
+from typing import Callable, Dict, Any, Awaitable
+from aiogram import BaseMiddleware
+from aiogram.types import Message, CallbackQuery, Update # Убедитесь, что Update импортирован
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker # Если вы используете асинхронную SQLAlchemy
+from sqlalchemy.orm import Session as SyncSession # Если вы используете синхронную SQLAlchemy
 from database import init_db, Session, Game, Player, Group
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update # Update нужен для Middleware
+from sqlalchemy import select # Очень важно для асинхронных запросов
+from sqlalchemy.orm import declarative_base
+from typing import Callable, Dict, Any, Awaitable
+from aiogram import BaseMiddleware
+
+    # Ваши модели из database.py
+from database import Player, Game, Group, Base
+ # Замените YOUR_MODELS_FILE
+
+
 # ИМПОРТ НОВЫХ КОНСТАНТ
 from utils.constants import (
     PHASE_DURATIONS, MIN_PLAYERS_TO_START, ROLES_CONFIG, ROLE_NAMES_RU,
@@ -1412,177 +1428,224 @@ async def cmd_help(message: Message):
 
 
  
-async def cmd_new_game(message: Message):
+async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: AsyncSession):
     """
     Обрабатывает команду /new_game.
     Создает новую игру в текущем чате, если таковой еще нет.
+    Регистрирует игрока в текущей игре или обновляет его данные.
     Добавляет инлайн-кнопки "Присоединиться" и "Начать игру".
     """
+    # 1. Проверка типа чата: команда работает только в групповых чатах
     if message.chat.type == ChatType.PRIVATE:
-        await message.reply(f"Эту команду можно использовать только в групповом чате. {PHASE_EMOJIS['day']}")
+        await message.reply("Эту команду можно использовать только в групповом чате. {FACTION_EMOJIS['day']}")
         return
 
-    with Session() as session:
-        try:
-            # Всегда гарантируем, что у игрока есть глобальный профиль
-            global_player = ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name)
-            
-            # Ищем ЛЮБУЮ игру с этим chat_id, независимо от статуса
-            existing_game_any_status = session.query(Game).filter_by(chat_id=message.chat.id).first()
-            
-            should_create_new_game = True
-            game_to_use = None
+    try:
+        # Получаем данные пользователя из сообщения Telegram
+        user_id = message.from_user.id
+        username = message.from_user.username
+        full_name = message.from_user.full_name
 
-            if existing_game_any_status:
-                if existing_game_any_status.status in ['waiting', 'playing']:
-                    game_to_use = existing_game_any_status
-                    should_create_new_game = False
-                    logging.info(f"Existing active/waiting game {game_to_use.id} found for chat {message.chat.id}. Updating message.")
-                else:
-                    logging.info(f"Found non-active game {existing_game_any_status.id} (status: {existing_game_any_status.status}) for chat {message.chat.id}. Deleting it.")
-                    
-                    for job in scheduler.get_jobs():
-                        if job.args and job.args[0] == existing_game_any_status.id:
-                            job.remove()
-                    logging.info(f"All scheduled jobs for game {existing_game_any_status.id} removed during deletion.")
+        # 2. Гарантируем, что у игрока есть глобальный профиль
+        # (Предполагается, что ensure_player_profile_exists работает с AsyncSession и await)
+        global_player = await ensure_player_profile_exists(session, user_id, username, full_name)
+        
+        # 3. Ищем ЛЮБУЮ игру с этим chat_id, независимо от статуса
+        result_game_any_status = await session.execute(select(Game).filter_by(chat_id=message.chat.id))
+        existing_game_any_status = result_game_any_status.scalars().first()
 
-                    if existing_game_any_status.start_message_id:
-                        try:
-                            await bot.delete_message(chat_id=existing_game_any_status.chat_id, message_id=existing_game_any_status.start_message_id)
-                            logging.info(f"Deleted old start message {existing_game_any_status.start_message_id} for game {existing_game_any_status.id}.")
-                        except (TelegramBadRequest, TelegramForbiddenError) as e:
-                            logging.warning(f"Could not delete old start message {existing_game_any_status.start_message_id} for game {existing_game_any_status.id}: {e}")
-                        except Exception as e:
-                            logging.error(f"Unknown error deleting old start message {existing_game_any_status.start_message_id} for game {existing_game_any_status.id}: {e}", exc_info=True)
-                    
-                    session.delete(existing_game_any_status)
-                    session.commit()
-                    logging.info(f"Old game {existing_game_any_status.id} (status: {existing_game_any_status.status}) for chat {message.chat.id} successfully deleted.")
-            
-            if should_create_new_game:
-                new_game = Game(chat_id=message.chat.id, status='waiting')
-                session.add(new_game)
-                session.flush()
-                game_to_use = new_game
-                logging.info(f"New game {game_to_use.id} created for chat {message.chat.id}.")
+        should_create_new_game = True
+        game_to_use = None
 
-                # --- Создание или получение Группы (Города) для чата ---
-                group = session.query(Group).filter_by(chat_id=message.chat.id).first()
-                if not group:
-                    chat_info = await bot.get_chat(message.chat.id)
-                    group_name = chat_info.title if chat_info.title else f"Группа {message.chat.id}"
-                    group = Group(chat_id=message.chat.id, name=group_name)
-                    session.add(group)
-                    session.flush() # Получаем ID новой группы до коммита
-                    logging.info(f"New Group {group.name} (ID: {group.id}) created for chat {message.chat.id}.")
-            
-                # Обновляем last_played_group_id для текущего игрока
-                # используем глобальный профиль для определения пола
-                player_gender = global_player.gender if global_player and global_player.gender != 'unspecified' else random.choice(['male', 'female'])
+        if existing_game_any_status:
+            # Если найдена игра, проверяем ее статус
+            if existing_game_any_status.status in ['waiting', 'playing']:
+                game_to_use = existing_game_any_status
+                should_create_new_game = False
+                logging.info(f"Existing active/waiting game {{game_to_use.id}} found for chat {{message.chat.id}}. Updating message.")
+            else:
+                # Если игра неактивна (например, 'finished', 'cancelled'), удаляем ее
+                logging.info(f"Found non-active game {{existing_game_any_status.id}} (status: {{existing_game_any_status.status}}) for chat {{message.chat.id}}. Deleting it.")
+                
+                # Удаляем запланированные задачи, если есть (если scheduler глобальный)
+                for job in scheduler.get_jobs():
+                    if job.args and job.args[0] == existing_game_any_status.id:
+                        job.remove()
+                        logging.info(f"All scheduled jobs for game {{existing_game_any_status.id}} removed during deletion.")
+                
+                # Попытка удалить старое сообщение регистрации игры
+                if existing_game_any_status.start_message_id:
+                    try:
+                        await bot.delete_message(chat_id=existing_game_any_status.chat_id, message_id=existing_game_any_status.start_message_id)
+                        logging.info(f"Deleted old start message {{existing_game_any_status.start_message_id}} for game {{existing_game_any_status.id}}.")
+                    except (TelegramBadRequest, TelegramForbiddenError) as e:
+                        logging.warning(f"Could not delete old start message {{existing_game_any_status.start_message_id}} for game {{existing_game_any_status.id}} for chat {{message.chat.id}}: {{e}}. Sending new message.", exc_info=True)
+                    except Exception as e:
+                        logging.error(f"Unknown error deleting old start message {{existing_game_any_status.start_message_id}} for game {{existing_game_any_status.id}} for chat {{message.chat.id}}: {{e}}", exc_info=True)
+                
+                await session.delete(existing_game_any_status) # Удаляем старую запись игры
+                await session.commit() # Фиксируем удаление
+                logging.info(f"Old game {{existing_game_any_status.id}} (status: {{existing_game_any_status.status}}) for chat {{message.chat.id}} successfully deleted.")
 
-                player = Player(
-                    user_id=message.from_user.id,
-                    username=message.from_user.username,
-                    full_name=message.from_user.full_name,
-                    game_id=game_to_use.id,
-                    gender=player_gender,
-                    last_played_group_id=group.id # Устанавливаем при создании
+        if should_create_new_game:
+            # Если нужно создать новую игру
+            new_game = Game(chat_id=message.chat.id, status='waiting')
+            session.add(new_game)
+            await session.flush() # Принудительно получаем ID для новой игры
+            game_to_use = new_game
+            logging.info(f"New game {{game_to_use.id}} created for chat {{message.chat.id}}.")
+
+        # 4. Создание или получение Группы (Города) для чата
+        result_group = await session.execute(select(Group).filter_by(chat_id=message.chat.id))
+        group = result_group.scalars().first()
+        if not group:
+            chat_info = await bot.get_chat(message.chat.id)
+            group_name = chat_info.title if chat_info.title else f"Группа {{message.chat.id}}"
+            group = Group(chat_id=message.chat.id, name=group_name)
+            session.add(group)
+            await session.flush() # Получаем ID новой группы до коммита
+            logging.info(f"New Group {{group.name}} (ID: {{group.id}}) created for chat {{message.chat.id}}.")
+        
+        # 5. Обработка игрока (регистрация или обновление в текущей игре)
+        # Обновляем last_played_group_id для текущего глобального игрока
+        global_player.last_played_group_id = group.id
+        
+        # Определяем пол игрока (используем глобальный профиль или случайный выбор)
+        player_gender = global_player.gender if global_player.gender != 'unspecified' else random.choice(['male', 'female'])
+
+        # --- НАЧАЛО ИСПРАВЛЕНИЯ IntegrityError (для Player в контексте игры) ---
+        # Проверяем, существует ли игрок в ЭТОЙ КОНКРЕТНОЙ ИГРЕ
+        result_player_in_game = await session.execute(select(Player).filter_by(
+            user_id=user_id, 
+            game_id=game_to_use.id
+        ))
+        player_in_game_check = result_player_in_game.scalars().first()
+
+        if player_in_game_check:
+            # Игрок уже в этой игре, обновляем его данные
+            player_in_game_check.username = username
+            player_in_game_check.full_name = full_name
+            player_in_game_check.gender = player_gender
+            # Здесь можно обновить другие поля, специфичные для игрока в игре
+            # Например, сбросить роль, если игра начинается заново
+            # player_in_game_check.role = 'civilian' 
+            # player_in_game_check.is_alive = True
+            logging.info(f"Player {{player_in_game_check.full_name}} ({{player_in_game_check.user_id}}) updated in existing game {{game_to_use.id}}.")
+            await message.reply("Вы уже присоединились к этой игре! Ваши данные обновлены.")
+        else:
+            # Игрока нет в этой игре, добавляем его
+            player = Player(
+                user_id=user_id, # Используем user_id напрямую
+                username=username,
+                full_name=full_name,
+                game_id=game_to_use.id,
+                gender=player_gender,
+                last_played_group_id=group.id,
+                # !!! ВАЖНО: Добавьте остальные обязательные поля для Player здесь !!!
+                # Например:
+                # role='civilian', is_alive=True, voted_for_player_id=None,
+                # night_action_target_id=None, selected_title='default',
+                # unlocked_frames=['default'], unlocked_titles=['default'],
+                # total_games=0, total_wins=0, total_kills=0, total_deaths=0,
+                # level=1, experience=0, dollars=0, diamonds=0
+            )
+            session.add(player)
+            logging.info(f"Player {{player.full_name}} ({{player.user_id}}) created and joined new game {{game_to_use.id}}.")
+            await message.reply("Вы успешно присоединились к игре!")
+        # --- КОНЕЦ ИСПРАВЛЕНИЯ IntegrityError ---
+
+        await session.commit() # Фиксируем все изменения (игрока, игры, группы, глобального профиля)
+
+        # 6. Подготовка и отправка сообщения о регистрации игры
+        result_players_in_game = await session.execute(select(Player).filter_by(game_id=game_to_use.id))
+        players_in_game = result_players_in_game.scalars().all()
+        num_players = len(players_in_game)
+        player_names_list = [f"<a href='tg://user?id={{p.user_id}}'>{{p.full_name}}</a>" for p in players_in_game]
+        player_list_str = "\n".join(player_names_list) if player_names_list else "Пока нет игроков. {FACTION_EMOJIS['missed']}"
+
+        result_organizer = await session.execute(select(Player).filter_by(game_id=game_to_use.id).order_by(Player.id))
+        organizer = result_organizer.scalars().first()
+        organizer_link = f"<a href='tg://user?id={{organizer.user_id}}'>{{organizer.full_name}}</a>" if organizer else "Неизвестный организатор"
+
+        message_text_to_send = (
+            f"Игpа в Мафию {'(создана)' if should_create_new_game else 'ожидается'}! {FACTION_EMOJIS['day']}\n"
+            f"Организатор: {organizer_link}\n"
+            f"Текущее количество игроков: <b>{{num_players}}</b>/{{MIN_PLAYERS_TO_START}}.\n"
+            f"Участники:\n{{player_list_str}}\n"
+            f"Чтобы присоединиться или начать игру, используйте кнопки ниже."
+        )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Присоединиться", callback_data=f"join_game_{game_to_use.id}")],
+            [InlineKeyboardButton(text="Начать игру {FACTION_EMOJIS['night']}",
+                                  callback_data=f"start_game_{game_to_use.id}")]
+        ])
+
+        if game_to_use.start_message_id:
+            try:
+                # Попытка обновить существующее сообщение
+                # edit_message_text возвращает Message, можно получить его message_id
+                sent_message = await bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=game_to_use.start_message_id,
+                    text=message_text_to_send,
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML
                 )
-                session.add(player)
-                session.commit()
-                logging.info(f"Player {player.full_name} ({player.user_id}) created and joined new game {game_to_use.id}.")
-            else: # Если игра уже существует
-                player_in_game_check = session.query(Player).filter_by(user_id=message.from_user.id, game_id=game_to_use.id).first()
-                if not player_in_game_check: # Если игрок не в текущей игре
-                    # --- Создание или получение Группы (Города) для чата ---
-                    group = session.query(Group).filter_by(chat_id=message.chat.id).first()
-                    if not group:
-                        chat_info = await bot.get_chat(message.chat.id)
-                        group_name = chat_info.title if chat_info.title else f"Группа {message.chat.id}"
-                        group = Group(chat_id=message.chat.id, name=group_name)
-                        session.add(group)
-                        session.flush()
-                        logging.info(f"New Group {group.name} (ID: {group.id}) created for chat {message.chat.id}.")
-                    # --- Конец создания/получения Группы ---
-
-                    player_gender = global_player.gender if global_player and global_player.gender != 'unspecified' else random.choice(['male', 'female'])
-
-                    player = Player(
-                        user_id=message.from_user.id,
-                        username=message.from_user.username,
-                        full_name=message.from_user.full_name,
-                        game_id=game_to_use.id,
-                        gender=player_gender,
-                        last_played_group_id=group.id # Добавляем это
-                    )
-                    session.add(player)
-                    session.commit()
-                    logging.info(f"Player {player.full_name} ({player.user_id}) joined existing game {game_to_use.id} via /new_game.")
-                # else: # Если игрок уже был в игре, просто обновим его last_played_group_id
-                #     # Здесь не нужно обновлять last_played_group_id, так как он уже должен быть установлен
-                #     #при первом присоединении к игре.
-                #     session.commit() # Просто коммитим, если других изменений не было
-
-            # ОБНОВЛЕНИЕ СООБЩЕНИЯ О РЕГИСТРАЦИИ
-            players_in_game = session.query(Player).filter_by(game_id=game_to_use.id).all()
-            num_players = len(players_in_game)
-            player_names_list = [f"<a href='tg://user?id={p.user_id}'>{p.full_name}</a>" for p in players_in_game]
-            player_list_str = "\n".join(player_names_list) if player_names_list else f"Пока нет игроков. {FACTION_EMOJIS['missed']}"
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Присоединиться", callback_data=f"join_game_{game_to_use.id}")],
-                [InlineKeyboardButton(text=f"Начать игру {PHASE_EMOJIS['night']}",
-                                      callback_data=f"start_game_{game_to_use.id}")]
-            ])
-
-            organizer = session.query(Player).filter_by(game_id=game_to_use.id).order_by(Player.id).first()
-            organizer_link = f"<a href='tg://user?id={organizer.user_id}'>{organizer.full_name}</a>" if organizer else "Неизвестный организатор"
-
-            message_text_to_send = (
-                f"Игра в Мафию {'создана' if should_create_new_game else 'ожидается'}! {PHASE_EMOJIS['day']}\n"
-                f"Организатор: {organizer_link}\n"
-                f"Текущее количество игроков: <b>{num_players}/{MIN_PLAYERS_TO_START}+</b>.\n"
-                f"Участники:\n{player_list_str}\n"
-                f"Чтобы присоединиться или начать игру, используйте кнопки ниже."
+                logging.info(f"Updated existing game {{game_to_use.id}} registration message (ID: {{game_to_use.start_message_id}}).")
+            except (TelegramBadRequest, TelegramForbiddenError) as e:
+                # Если не удалось обновить (например, сообщение удалено), отправляем новое
+                logging.warning(f"Could not edit existing game registration message (game_to_use.start_message_id) for chat {{message.chat.id}}: {{e}}. Sending new message.", exc_info=True)
+                
+                # Удаляем старый ID сообщения и отправляем новое
+                game_to_use.start_message_id = None
+                session.add(game_to_use) # Добавляем game_to_use обратно в сессию, если она была изменена
+                await session.commit() # Фиксируем изменение (удаление start_message_id)
+                
+                sent_message = await bot.send_message(
+                    chat_id=message.chat.id,
+                    text=message_text_to_send,
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML
                 )
-
-            if game_to_use.start_message_id:
-                try:
-                    await bot.edit_message_text(
-                        chat_id=message.chat.id,
-                        message_id=game_to_use.start_message_id,
-                        text=message_text_to_send,
-                        reply_markup=keyboard,
-                        parse_mode=ParseMode.HTML
-                    )
-                    await message.delete()
-                    logging.info(f"Updated existing game {game_to_use.id} registration message (ID: {game_to_use.start_message_id}).")
-                    return
-                except (TelegramBadRequest, TelegramForbiddenError) as e:
-                    logging.warning(f"Could not edit existing game registration message {game_to_use.start_message_id} for chat {message.chat.id}: {e}. Sending new message.", exc_info=True)
-                    game_to_use.start_message_id = None
-                    session.add(game_to_use)
-                    session.commit()
-                except Exception as e:
-                    logging.error(f"Unknown error editing existing game registration message {game_to_use.start_message_id} for chat {message.chat.id}: {e}", exc_info=True)
-                    game_to_use.start_message_id = None
-                    session.add(game_to_use)
-                    session.commit()
-
-            sent_message = await message.reply(
+                game_to_use.start_message_id = sent_message.message_id
+                session.add(game_to_use)
+                await session.commit() # Фиксируем новый start_message_id
+                logging.info(f"Sent new game registration message (sent_message.message_id) for game {{game_to_use.id}}.")
+            except Exception as e:
+                logging.error(f"Unknown error editing existing game registration message (game_to_use.start_message_id) for game {{game_to_use.id}} for chat {{message.chat.id}}: {{e}}", exc_info=True)
+                
+                # Если произошла другая ошибка при обновлении, также отправляем новое
+                game_to_use.start_message_id = None
+                session.add(game_to_use)
+                await session.commit()
+                sent_message = await bot.send_message(
+                    chat_id=message.chat.id,
+                    text=message_text_to_send,
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML
+                )
+                game_to_use.start_message_id = sent_message.message_id
+                session.add(game_to_use)
+                await session.commit()
+                logging.info(f"Sent new game registration message (sent_message.message_id) for game {{game_to_use.id}} due to previous error.")
+        else:
+            # Если start_message_id нет, отправляем новое сообщение
+            sent_message = await bot.send_message(
+                chat_id=message.chat.id,
                 text=message_text_to_send,
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML
             )
             game_to_use.start_message_id = sent_message.message_id
             session.add(game_to_use)
-            session.commit()
-            logging.info(f"Sent new game registration message {sent_message.message_id} for game {game_to_use.id}.")
+            await session.commit()
+            logging.info(f"Sent new game registration message (sent_message.message_id) for game {{game_to_use.id}}.")
 
-        except Exception as e:
-            logging.error(f"Критическая ошибка в cmd_new_game для chat {message.chat.id}: {e}", exc_info=True)
-            await message.reply(f"Произошла ошибка при создании игры. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-            session.rollback()
- 
+    except Exception as e:
+        logging.error(f"Критическая ошибка в cmd_new_game для чата {{message.chat.id}}: {{e}}", exc_info=True)
+        await session.rollback() # Откатываем все изменения в случае критической ошибки (для AsyncSession)
+        await message.reply(f"Произошла ошибка при создании игры. Попробуйте позже. {{FACTION_EMOJIS['missed']}}")
 async def cmd_join(message: Message):
     """
     Обрабатывает команду /join.
@@ -4118,9 +4181,24 @@ async def delete_non_game_messages(message: Message):
             logging.error(f"Bot lacks permissions to delete messages in chat {message.chat.id}. Please grant 'Delete Messages' permission.")
         except Exception as e:
             logging.error(f"CRITICAL ERROR in delete_non_game_messages for chat {message.chat.id} from {message.from_user.full_name} (ID: {message.from_user.id}): {e}", exc_info=True)
-            
+class DbSessionMiddleware(BaseMiddleware):
+        def __init__(self, session_pool: async_sessionmaker):
+            self.session_pool = session_pool
+
+        async def __call__(
+            self,
+            handler: Callable[[Update, Dict[str, Any]], Awaitable[Any]],
+            event: Update,
+            data: Dict[str, Any]
+        ) -> Any:
+            # Создаем новую асинхронную сессию из пула для каждого запроса
+            async with self.session_pool() as session:
+                data["session"] = session # Добавляем сессию в данные апдейта
+                return await handler(event, data)            
+AsyncSessionLocal = None # Эту переменную вы, вероятно, создавали в database.py, но она нужна здесь для Middleware
+engine = None
 async def main():
-    global bot_self_info, BOT_ID, bot, dp
+    global engine, AsyncSessionLocal # Убедитесь, что эти переменные глобальны, если вы их так используете
     logging.info("--- Main function started ---")
 
     # 1. Создание connector (для прокси)
@@ -4132,40 +4210,52 @@ async def main():
         logging.info("Not using proxy.")
 
     # 2. Создание ОБЪЕКТА aiohttp.ClientSession ОДИН РАЗ
-    aiogram_session_instance = aiohttp.ClientSession()
-
-    # 3. Определение АСИНХРОННОЙ ВЫЗЫВАЕМОЙ ФУНКЦИИ для параметра 'session' в Bot
-    async def custom_session_callable(bot_instance: Bot, method: TelegramMethod, timeout: int | float | None = None):
-        # type hints добавлены для ясности
-        if not isinstance(method, TelegramMethod):
-             logging.error(f"custom_session_callable received unexpected method type: {type(method)}")
-             raise TypeError(f"Expected TelegramMethod, got {type(method)}")
-
-        base_api_url = "https://api.telegram.org"
-        full_url = f"{base_api_url}/bot{BOT_TOKEN}/{method.__api_method__}"
-        payload = method.model_dump_json() # Используем model_dump_json для aiogram v3
-        
-        async with aiogram_session_instance.post(full_url, data=payload, headers={'Content-Type': 'application/json'}, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-            resp.raise_for_status()
-            json_response = await resp.json()
-            
-            if json_response.get('ok') and 'result' in json_response:
-                return method.__returning__.model_validate(json_response['result'])
-            else:
-                raise Exception(f"Telegram API error: {json_response.get('description', 'Unknown error')}")
-
+##    aiogram_session_instance = aiohttp.ClientSession(connector=connector) # Или без connector, если он не нужен
+##   
+##    # 3. Определение АСИНХРОННОЙ ВЫЗЫВАЕМОЙ ФУНКЦИИ для параметра 'session' в Bot
+##    async def custom_session_callable(bot_instance: Bot, method: TelegramMethod, timeout: int | float | None = None):
+##        # type hints добавлены для ясности
+##        if not isinstance(method, TelegramMethod):
+##             logging.error(f"custom_session_callable received unexpected method type: {type(method)}")
+##             raise TypeError(f"Expected TelegramMethod, got {type(method)}")
+##
+##        base_api_url = "https://api.telegram.org"
+##        full_url = f"{base_api_url}/bot{BOT_TOKEN}/{method.__api_method__}"
+##        payload = method.model_dump_json() # Используем model_dump_json для aiogram v3
+##        
+##        async with aiogram_session_instance.post(full_url, data=payload, headers=headers) as resp:
+##            resp.raise_for_status()
+##            json_response = await resp.json()
+##            if json_response.get('ok') and 'result' in json_response:
+##                return method._returning_._model_validate(json_response['result'])
+##            else:
+##                raise Exception(f"Telegram API error: {json_response.get('description')}")
     # 4. Инициализация Bot
+    # Получаем BOT_TOKEN и DATABASE_URL (например, из .env)
+    # Убедитесь, что load_dotenv() был вызван где-то до main()
+    BOT_TOKEN = getenv("BOT_TOKEN") 
+    DATABASE_URL = getenv("DATABASE_URL", "sqlite+aiosqlite:///./mafia_game.db")
+
+    logging.info("Starting database initialization...")
+    engine = create_async_engine(DATABASE_URL, echo=True)
+    
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all) # Создание таблиц
+    
+    AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    logging.info("Database initialized successfully.")
     bot = Bot(token=BOT_TOKEN,
-          default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-          session=aiogram_session_instance, # <-- ИЗМЕНЕНО!
-          request_timeout=60.0)
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        request_timeout=60.0) # <-- Аргумент session УДАЛЕН
+    
+
 
 
     # =====================================================================
     # === СНАЧАЛА ИНИЦИАЛИЗИРУЕМ DP =======================================
     # =====================================================================
     dp = Dispatcher(storage=MemoryStorage()) # <--- ЭТА СТРОКА ДОЛЖНА БЫТЬ ЗДЕСЬ
-
+    dp.update.middleware(DbSessionMiddleware(session_pool=AsyncSessionLocal))
     # 5. Получение информации о боте (для проверки)
     print("Bot and Dispatcher initialized.")
     try:
@@ -4267,7 +4357,8 @@ async def main():
         logging.info("Starting bot polling")
         await dp.start_polling(bot)
     finally:
-        logging.info("Bot polling stopped. Closing session.")
+        logging.info("Bot polling stopped. Closing database engine.")
+        await engine.dispose() # Важно закрыть соединение с БД при завершении
         await aiogram_session_instance.close()
         logging.info("Session closed. Application exit.")
 
