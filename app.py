@@ -4132,7 +4132,7 @@ async def main():
         logging.info("Not using proxy.")
 
     # 2. Создание ОБЪЕКТА aiohttp.ClientSession ОДИН РАЗ
-    aiogram_session_instance = aiohttp.ClientSession(connector=connector)
+    aiogram_session_instance = aiohttp.ClientSession()
 
     # 3. Определение АСИНХРОННОЙ ВЫЗЫВАЕМОЙ ФУНКЦИИ для параметра 'session' в Bot
     async def custom_session_callable(bot_instance: Bot, method: TelegramMethod, timeout: int | float | None = None):
@@ -4156,9 +4156,10 @@ async def main():
 
     # 4. Инициализация Bot
     bot = Bot(token=BOT_TOKEN,
-              default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-              session=custom_session_callable,
-              request_timeout=60.0)
+          default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+          session=aiogram_session_instance, # <-- ИЗМЕНЕНО!
+          request_timeout=60.0)
+
 
     # =====================================================================
     # === СНАЧАЛА ИНИЦИАЛИЗИРУЕМ DP =======================================
@@ -4222,9 +4223,9 @@ async def main():
     dp.callback_query.register(callback_donate_prompt, F.data == "donate_prompt") # <--- ИСПРАВЛЕННОЕ ИМЯ ХЭНДЛЕРА
 
     # Регистрация FSM хэндлеров
-    dp.message.register(process_farewell_message, GameState.waiting_for_farewell_m)
-    dp.message.register(handle_faction_message, GameState.waiting_for_faction_mess)
-    dp.callback_query.register(callback_select_donate_group, GameState.waiting_for_don_group_selection)
+    dp.message.register(process_farewell_message, GameState.waiting_for_farewell_message)
+    dp.message.register(handle_faction_message, GameState.waiting_for_faction_message)
+    dp.callback_query.register(callback_select_donate_group, GameState.waiting_for_donate_group_selection)
 
     # Регистрация других типов хэндлеров
     dp.message.register(handle_gif, F.animation, F.chat.type == ChatType.PRIVATE)
