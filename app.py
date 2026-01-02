@@ -1203,10 +1203,10 @@ async def send_death_notification_and_farewell_prompt(user_id: int, game_id: int
 
 # --- НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ensure_player_profile_exists ---
 async def ensure_player_profile_exists(session: AsyncSession, user_id: int, username: str | None, full_name: str, bot_id: int): # <--- ИСПРАВЛЕНИЕ ТУТ: ИСПОЛЬЗУЙТЕ 'bot_id'
-        global BOT_ID # Эта строка, скорее всего, не нужна, если вы передаете bot_id как аргумент.
+    global BOT_ID # Эта строка, скорее всего, не нужна, если вы передаете bot_id как аргумент.
                       # Но оставлю её закомментированной, если вы решите её оставить.    if current_bot_id is None: # Используем current_bot_id
-        logging.critical("current_bot_id is None when ensure_player_profile_exists is called.")
-        raise ValueError("current_bot_id cannot be None")
+    logging.critical("current_bot_id is None when ensure_player_profile_exists is called.")
+    raise ValueError("current_bot_id cannot be None")
 
      
 
@@ -1433,7 +1433,8 @@ async def cmd_help(message: Message):
 
 
  
-async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: AsyncSession):    """
+async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: AsyncSession):
+    """
     Обрабатывает команду /new_game.
     Создает новую игру в текущем чате, если таковой еще нет.
     Регистрирует игрока в текущей игре или обновляет его данные.
