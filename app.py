@@ -4161,7 +4161,7 @@ async def main():
               session=custom_session_callable,
               request_timeout=60.0)
 
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=MemoryStorage()) # <--- СНАЧАЛА ИНИЦИАЛИЗИРУЕМ DP
 
     print("Bot and Dispatcher initialized.")
     try:
@@ -4175,9 +4175,8 @@ async def main():
         await aiogram_session_instance.close()
         return
 
-    init_db()
-    logging.info("Database initialized.")
-    print("Database initialized.")
+##    await init_db()
+##    logging.info("Database initialized.")
 
      
 
