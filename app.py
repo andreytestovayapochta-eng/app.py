@@ -33,6 +33,7 @@ from sqlalchemy import select # Очень важно для асинхронн�
 from sqlalchemy.orm import declarative_base
 from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware
+from sqlalchemy.ext.asyncio import create_async_engine
 
     # Ваши модели из database.py
 from database import Player, Game, Group, Base
@@ -1201,14 +1202,20 @@ async def send_death_notification_and_farewell_prompt(user_id: int, game_id: int
 
 
 # --- НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ensure_player_profile_exists ---
-def ensure_player_profile_exists(session, user_id: int, username: str, full_name: str):
-    global BOT_ID
+async def ensure_player_profile_exists(session: AsyncSession, user_id: int, username: str | None, full_name: str, bot_id: int): # <--- ИСПРАВЛЕНИЕ ТУТ: ИСПОЛЬЗУЙТЕ 'bot_id'
+        global BOT_ID # Эта строка, скорее всего, не нужна, если вы передаете bot_id как аргумент.
+                      # Но оставлю её закомментированной, если вы решите её оставить.    if current_bot_id is None: # Используем current_bot_id
+        logging.critical("current_bot_id is None when ensure_player_profile_exists is called.")
+        raise ValueError("current_bot_id cannot be None")
 
-    if BOT_ID is None:
-        logging.error("CRITICAL: BOT_ID is None when ensure_player_profile_exists is called.")
-        return None
+     
 
-    if user_id == BOT_ID:
+    if bot_id is None: # <--- Используйте 'bot_id' здесь
+        logging.critical("BOT_ID is None when ensure_player_profile_exists is called.")
+        raise ValueError("BOT_ID cannot be None")
+
+
+    if user_id == bot_id: # <--- Используйте 'bot_id' здесь
         logging.warning(f"WARNING: Attempted to get/create global player profile for bot's own ID ({user_id}). Skipping.")
         return None
 
@@ -1225,12 +1232,12 @@ def ensure_player_profile_exists(session, user_id: int, username: str, full_name
                 gender=player_gender,
                 dollars=0,
                 diamonds=0.0,
-                # НОВЫЕ ПОЛЯ ДЛЯ КАСТОМИЗАЦИИ
+                    # НОВЫЕ ПОЛЯ ДЛЯ КАСТОМИЗАЦИИ
                 selected_frame='default',
                 selected_title='default',
                 unlocked_frames=json.dumps(UNLOCKED_FRAMES_DEFAULT), # Инициализация с дефолтными
                 unlocked_titles=json.dumps(UNLOCKED_TITLES_DEFAULT), # Инициализация с дефолтными
-                # game_id оставляем None для глобального профиля
+                    # game_id оставляем None для глобального профиля
             )
             session.add(global_player_profile)
             session.flush()
@@ -1239,19 +1246,17 @@ def ensure_player_profile_exists(session, user_id: int, username: str, full_name
             global_player_profile.username = username
             global_player_profile.full_name = full_name
             session.add(global_player_profile)
-                
+
         return global_player_profile
     except Exception as e:
         logging.error(f"ERROR: Exception in ensure_player_profile_exists for user {user_id}: {e}", exc_info=True)
         session.rollback()
-        return None# Важно вернуть None при ошибке
-# ---Хэндлеры команд ---
-
+        return None
 
 async def cmd_start(message: Message, command: Command):
     with Session() as session:
         try:
-            player_data = ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name)
+            player_data = ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ ЗДЕСЬ
             if player_data is None:
                 logging.error(f"Failed to get/create player profile for user {message.from_user.id}. Possibly bot's own ID.")
                 await message.reply(f"Произошла ошибка при загрузке вашего профиля. Попробуйте позже. {FACTION_EMOJIS['missed']}")
@@ -1428,8 +1433,7 @@ async def cmd_help(message: Message):
 
 
  
-async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: AsyncSession):
-    """
+async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: AsyncSession):    """
     Обрабатывает команду /new_game.
     Создает новую игру в текущем чате, если таковой еще нет.
     Регистрирует игрока в текущей игре или обновляет его данные.
@@ -1446,10 +1450,14 @@ async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: A
         username = message.from_user.username
         full_name = message.from_user.full_name
 
-        # 2. Гарантируем, что у игрока есть глобальный профиль
-        # (Предполагается, что ensure_player_profile_exists работает с AsyncSession и await)
-        global_player = await ensure_player_profile_exists(session, user_id, username, full_name)
-        
+        # Используйте GLOBAL_BOT_ID, который вы получили ранее
+        global_player = await ensure_player_profile_exists(
+            session=session,
+            user_id=user_id,
+            username=username,
+            full_name=full_name,
+            bot_id=BOT_ID # <--- ИСПРАВЛЕНИЕ ЗДЕСЬ: ИСПОЛЬЗУЙТЕ 'bot_id'
+        )
         # 3. Ищем ЛЮБУЮ игру с этим chat_id, независимо от статуса
         result_game_any_status = await session.execute(select(Game).filter_by(chat_id=message.chat.id))
         existing_game_any_status = result_game_any_status.scalars().first()
@@ -4198,7 +4206,7 @@ class DbSessionMiddleware(BaseMiddleware):
 AsyncSessionLocal = None # Эту переменную вы, вероятно, создавали в database.py, но она нужна здесь для Middleware
 engine = None
 async def main():
-    global engine, AsyncSessionLocal # Убедитесь, что эти переменные глобальны, если вы их так используете
+    global bot, dp, bot_self_info, BOT_ID, AsyncSessionLocal, engine # Добавьте BOT_ID
     logging.info("--- Main function started ---")
 
     # 1. Создание connector (для прокси)
@@ -4235,7 +4243,7 @@ async def main():
     # Убедитесь, что load_dotenv() был вызван где-то до main()
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     print(f"DEBUG: BOT_TOKEN is {{BOT_TOKEN}}") # Проверим, что токен получается
-    DATABASE_URL = getenv("DATABASE_URL", "sqlite+aiosqlite:///./mafia_game.db")
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./mafia_game.db")
 
     logging.info("Starting database initialization...")
     engine = create_async_engine(DATABASE_URL, echo=True)
@@ -4245,29 +4253,25 @@ async def main():
     
     AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     logging.info("Database initialized successfully.")
-    bot = Bot(token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-        request_timeout=60.0) # <-- Аргумент session УДАЛЕН
     
-
-
-
-    # =====================================================================
-    # === СНАЧАЛА ИНИЦИАЛИЗИРУЕМ DP =======================================
-    # =====================================================================
-    dp = Dispatcher(storage=MemoryStorage()) # <--- ЭТА СТРОКА ДОЛЖНА БЫТЬ ЗДЕСЬ
+    # После инициализации бота и, возможно, получения информации о нем
+    bot = Bot(
+        token=BOT_TOKEN,
+        default_properties=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(DbSessionMiddleware(session_pool=AsyncSessionLocal))
     # 5. Получение информации о боте (для проверки)
     print("Bot and Dispatcher initialized.")
     try:
         bot_self_info = await bot.get_me()
-        BOT_ID = bot_self_info.id
+        BOT_ID = bot_self_info.id # <--- УБЕДИТЕСЬ, ЧТО ЭТО ЗДЕСЬ
         logging.info(f"Bot username: @{bot_self_info.username}, Bot ID: {BOT_ID}")
         print(f"Got bot info: @{bot_self_info.username}")
     except Exception as e:
         logging.error(f"Failed to get bot info: {e}", exc_info=True)
         print(f"ERROR: Failed to get bot info: {e}")
-        await aiogram_session_instance.close()
+        # await aiogram_session_instance.close() # Эта строка может быть лишней, если aiogram_session_instance не используется
         return
 
     # 6. Инициализация базы данных (если нужна и функция async def init_db() существует)
