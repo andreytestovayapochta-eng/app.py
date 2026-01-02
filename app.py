@@ -4123,6 +4123,7 @@ async def main():
     global bot_self_info, BOT_ID, bot, dp
     logging.info("--- Main function started ---")
 
+    # 1. Создание connector (для прокси)
     connector = None
     if PROXY_URL:
         connector = aiohttp.ProxyConnector.from_url(PROXY_URL)
@@ -4130,43 +4131,45 @@ async def main():
     else:
         logging.info("Not using proxy.")
 
+    # 2. Создание ОБЪЕКТА aiohttp.ClientSession ОДИН РАЗ
     aiogram_session_instance = aiohttp.ClientSession(connector=connector)
 
-    async def custom_session_callable(bot_instance, method, timeout=None):
+    # 3. Определение АСИНХРОННОЙ ВЫЗЫВАЕМОЙ ФУНКЦИИ для параметра 'session' в Bot
+    async def custom_session_callable(bot_instance: Bot, method: TelegramMethod, timeout: int | float | None = None):
+        # type hints добавлены для ясности
         if not isinstance(method, TelegramMethod):
              logging.error(f"custom_session_callable received unexpected method type: {type(method)}")
              raise TypeError(f"Expected TelegramMethod, got {type(method)}")
 
         base_api_url = "https://api.telegram.org"
         full_url = f"{base_api_url}/bot{BOT_TOKEN}/{method.__api_method__}"
-        payload = method.model_dump_json()
+        payload = method.model_dump_json() # Используем model_dump_json для aiogram v3
         
         async with aiogram_session_instance.post(full_url, data=payload, headers={'Content-Type': 'application/json'}, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             resp.raise_for_status()
-            json_response = await resp.json() # Получаем сырой JSON-ответ
+            json_response = await resp.json()
             
-            # ИЗМЕНЕНИЕ ЗДЕСЬ: Десериализуем JSON-ответ в ожидаемую Pydantic-модель
-            # method.__returning__ - это тип, который aiogram ожидает в ответ
-            # Например, для GetMe, method.__returning__ будет aiogram.types.user.User
-            # json_response['result'] - это данные, которые нужно парсить
             if json_response.get('ok') and 'result' in json_response:
-                # Используем Pydantic model_validate для парсинга
-                # method.__returning__ - это Pydantic-модель (например, User)
-                return method.__returning__.model_validate(json_response['result']) # <--- ИЗМЕНЕНИЕ
+                return method.__returning__.model_validate(json_response['result'])
             else:
                 raise Exception(f"Telegram API error: {json_response.get('description', 'Unknown error')}")
 
+    # 4. Инициализация Bot
     bot = Bot(token=BOT_TOKEN,
               default=DefaultBotProperties(parse_mode=ParseMode.HTML),
               session=custom_session_callable,
               request_timeout=60.0)
 
-    dp = Dispatcher(storage=MemoryStorage()) # <--- СНАЧАЛА ИНИЦИАЛИЗИРУЕМ DP
+    # =====================================================================
+    # === СНАЧАЛА ИНИЦИАЛИЗИРУЕМ DP =======================================
+    # =====================================================================
+    dp = Dispatcher(storage=MemoryStorage()) # <--- ЭТА СТРОКА ДОЛЖНА БЫТЬ ЗДЕСЬ
 
+    # 5. Получение информации о боте (для проверки)
     print("Bot and Dispatcher initialized.")
     try:
-        bot_self_info = await bot.get_me() # Теперь это должен быть объект User
-        BOT_ID = bot_self_info.id # <--- Это должно сработать
+        bot_self_info = await bot.get_me()
+        BOT_ID = bot_self_info.id
         logging.info(f"Bot username: @{bot_self_info.username}, Bot ID: {BOT_ID}")
         print(f"Got bot info: @{bot_self_info.username}")
     except Exception as e:
@@ -4175,12 +4178,23 @@ async def main():
         await aiogram_session_instance.close()
         return
 
-##    await init_db()
-##    logging.info("Database initialized.")
+    # 6. Инициализация базы данных (если нужна и функция async def init_db() существует)
+    # Если init_db() определена на верхнем уровне как async def,
+    # и вы хотите ее вызвать, раскомментируйте:
+    # await init_db()
+    # logging.info("Database initialized.")
 
-     
+    # =====================================================================
+    # === ТЕПЕРЬ МОЖНО РЕГИСТРИРОВАТЬ ХЭНДЛЕРЫ ============================
+    # =====================================================================
 
-    # Регистрация всех хэндлеров (они будут видеть глобальные bot и dp)
+    # # Комментарии к регистрациям (для справки):
+    # # F.data.startswith('...') - для колбэков, начинающихся с определенной строки
+    # # Command("...") - для команд
+    # #GameState.waiting_for_farewell_m - для FSM-состояний
+    # # F.animation, F.chat.type == ChatType.PRIVATE - для фильтрации сообщений
+
+    # Регистрация всех хэндлеров сообщений
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_new_game, Command("new_game"))
@@ -4194,6 +4208,7 @@ async def main():
     dp.message.register(cmd_give_dollars, Command("give_dollars"))
     dp.message.register(cmd_give_diamonds, Command("give_diamonds"))
 
+    # Регистрация всех хэндлеров колбэков
     dp.callback_query.register(callback_join_game, F.data.startswith('join_game_'))
     dp.callback_query.register(callback_start_game, F.data.startswith('start_game_'))
     dp.callback_query.register(callback_set_gender_prompt, F.data == "set_gender_prompt")
@@ -4202,63 +4217,23 @@ async def main():
     dp.callback_query.register(callback_lynch_vote, F.data.startswith('lynch_'))
     dp.callback_query.register(callback_mafia_kill, F.data.startswith('mafia_kill_'))
     dp.callback_query.register(callback_doctor_heal, F.data.startswith('doctor_heal_'))
-    dp.callback_query.register(callback_commissioner_check, F.data.startswith('com_check_'))
+    dp.callback_query.register(callback_commissioner_check, F.data.startswith('commissioner_check_'))
     dp.callback_query.register(callback_maniac_kill, F.data.startswith('maniac_kill_'))
+    dp.callback_query.register(callback_donate_prompt, F.data == "donate_prompt") # <--- ИСПРАВЛЕННОЕ ИМЯ ХЭНДЛЕРА
 
-    dp.message.register(process_farewell_message, GameState.waiting_for_farewell_message, F.text)
-    dp.message.register(handle_faction_message, GameState.waiting_for_faction_message, F.text)
+    # Регистрация FSM хэндлеров
+    dp.message.register(process_farewell_message, GameState.waiting_for_farewell_m)
+    dp.message.register(handle_faction_message, GameState.waiting_for_faction_mess)
+    dp.callback_query.register(callback_select_donate_group, GameState.waiting_for_don_group_selection)
 
+    # Регистрация других типов хэндлеров
     dp.message.register(handle_gif, F.animation, F.chat.type == ChatType.PRIVATE)
-
     dp.message.register(delete_non_game_messages, F.chat.type.in_([ChatType.GROUP, ChatType.SUPERGROUP]))
 
-    # Новые FSM хэндлеры для пожертвований
-    dp.callback_query.register(callback_select_donate_group, GameState.waiting_for_donate_group_selection, F.data.startswith('select_donate_group_'))
-    dp.callback_query.register(callback_donate_currency_selection, GameState.waiting_for_donate_currency_selection, F.data.startswith('donate_currency_'))
-    dp.message.register(process_donate_dollars_amount, GameState.waiting_for_donate_dollars_amount, F.text)
-    dp.message.register(process_donate_diamonds_amount, GameState.waiting_for_donate_diamonds_amount, F.text)
 
-    # НОВЫЕ РЕГИСТРАЦИИ ДЛЯ КАСТОМИЗАЦИИ
-    dp.callback_query.register(callback_select_frame_prompt, F.data == "select_frame_prompt")
-    dp.callback_query.register(callback_preview_frame, GameState.waiting_for_frame_selection, F.data.startswith('preview_frame_'))
-    dp.callback_query.register(callback_confirm_frame_action, GameState.waiting_for_frame_preview_action, F.data.startswith('confirm_frame_action_'))
-    dp.callback_query.register(callback_back_to_frames_list, F.data == "back_to_frames_list")
-    dp.callback_query.register(callback_back_to_profile, F.data == "back_to_profile")
-    dp.callback_query.register(callback_select_title_prompt, F.data == "select_title_prompt")
-    dp.callback_query.register(callback_preview_title, GameState.waiting_for_title_selection, F.data.startswith('preview_title_'))
-    dp.callback_query.register(callback_confirm_title_action, GameState.waiting_for_title_preview_action, F.data.startswith('confirm_title_action_'))
-    dp.callback_query.register(callback_back_to_titles_list, F.data == "back_to_titles_list")
-
-    # Исправлена логика для callback_donate_prompt
-    dp.callback_query.register(callback_donate_prompt_handler, F.data == "donate_prompt")
-    print("All handlers registered.")
-    
-    # Объявление callback_donate_prompt_handler должно быть выше его регистрации
-    async def callback_donate_prompt_handler(query: CallbackQuery):
-        await query.answer()
-
-        async def edit_callback_message_func(text, reply_markup=None, parse_mode=ParseMode.HTML):
-            try:
-                await query.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-            except TelegramBadRequest as e:
-                logging.warning(f"Не удалось отредактировать сообщение в callback_donate_prompt для пользователя {query.from_user.id}: {e}")
-                await bot.send_message(query.from_user.id, text, reply_markup=reply_markup, parse_mode=parse_mode)
-            except Exception as e:
-                logging.error(f"Ошибка при редактировании сообщения в callback_donate_prompt для пользователя {query.from_user.id}: {e}", exc_info=True)
-                await bot.send_message(query.from_user.id, text, reply_markup=reply_markup, parse_mode=parse_mode)
-
-        state = dp.fsm.get_context(bot=bot, chat_id=query.from_user.id, user_id=query.from_user.id)
-        await _process_donate_command_logic(
-            query.from_user.id,
-            query.from_user.username,
-            query.from_user.full_name,
-            query.message.chat.id,
-            state,
-            edit_callback_message_func
-        )
-        
+     
     scheduler_needs_restart = False
-    with Session() as session:
+    with Session() as session: # Если scheduler использует БД
         active_games_in_db = session.query(Game).filter(Game.status == 'playing').all()
         for game in active_games_in_db:
             if game.phase_end_time and game.phase_end_time > datetime.datetime.now():
@@ -4273,20 +4248,20 @@ async def main():
                 elif game.phase == 'night':
                     scheduler.add_job(end_night_phase_processing, 'date', run_date=game.phase_end_time, args=[game.id], id=job_id)
             else:
-                logging.warning(f"Game {game.id} found with expired phase {game.phase} end time. Forcing phase transition.")
-                if game.phase == 'day':
-                    await end_day_phase(game.id)
-                elif game.phase == 'voting':
-                    await end_voting_phase(game.id)
-                elif game.phase == 'lynch_vote':
-                    await end_lynch_voting_phase(game.id)
-                elif game.phase == 'night':
-                    await end_night_phase_processing(game.id)
+                 logging.warning(f"Game {game.id} found with expired phase {game.phase} end time. Forcing phase transition.")
+                 if game.phase == 'day':
+                     await end_day_phase(game.id)
+                 elif game.phase == 'voting':
+                     await end_voting_phase(game.id)
+                 elif game.phase == 'lynch_vote':
+                     await end_lynch_voting_phase(game.id)
+                 elif game.phase == 'night':
+                     await end_night_phase_processing(game.id)
     scheduler.start()
     logging.info("Scheduler started.")
     print("Scheduler started.")
-    
-    # Теперь вызываем polling один раз, и это последняя асинхронная операция в main
+
+    # 9. Запуск поллинга бота
     try:
         logging.info("Starting bot polling")
         await dp.start_polling(bot)
@@ -4295,6 +4270,12 @@ async def main():
         await aiogram_session_instance.close()
         logging.info("Session closed. Application exit.")
 
+# =========================================================================
+# === ТОЧКА ВХОДА В СКРИПТ ================================================
+# =========================================================================
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
+
+
+    
