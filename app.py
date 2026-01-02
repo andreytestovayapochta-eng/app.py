@@ -4233,7 +4233,8 @@ async def main():
     # 4. Инициализация Bot
     # Получаем BOT_TOKEN и DATABASE_URL (например, из .env)
     # Убедитесь, что load_dotenv() был вызван где-то до main()
-    BOT_TOKEN = getenv("BOT_TOKEN") 
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    print(f"DEBUG: BOT_TOKEN is {{BOT_TOKEN}}") # Проверим, что токен получается
     DATABASE_URL = getenv("DATABASE_URL", "sqlite+aiosqlite:///./mafia_game.db")
 
     logging.info("Starting database initialization...")
