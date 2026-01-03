@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import random
 import datetime
 import json
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, Router, types 
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -1223,19 +1223,23 @@ async def ensure_player_profile_exists(session: AsyncSession, user_id: int, user
         return None
 
     try:
-        # Используем await session.execute(select(...)) для асинхронных запросов
+        # ИСПРАВЛЕНИЕ: Ищем игрока ТОЛЬКО по user_id, так как это его УНИКАЛЬНЫЙ идентификатор.
+        # Удаляем filter_by(game_id=None)
         result_global_profile = await session.execute(
-            select(Player).filter_by(user_id=user_id, game_id=None)
+            select(Player).filter_by(user_id=user_id) # <--- ИЗМЕНЕНИЕ ЗДЕСЬ
         )
         global_player_profile = result_global_profile.scalars().first()
 
         if not global_player_profile:
-            # Ищем любую запись игрока, чтобы получить пол, если он уже установлен в игре
-            result_any_player_record = await session.execute(
-                select(Player).filter_by(user_id=user_id)
-            )
-            any_player_record = result_any_player_record.scalars().first()
-            player_gender = any_player_record.gender if any_player_record and any_player_record.gender != 'unspecified' else 'unspecified'
+            # Если глобального профиля нет, создаем его.
+            # Если player_gender уже где-то определен (например, из any_player_record), 
+            # используйте его. В противном случае, по умолчанию 'unspecified'.
+            # Ваша логика с any_player_record здесь некорректна, т.к. global_player_profile
+            # не найден, значит any_player_record тоже не найдет ничего, 
+            # если фильтр по user_id единственно правильный.
+            # Если глобального профиля НЕТ, то и других записей игрока с этим user_id НЕТ.
+            player_gender = 'unspecified' # Если профиля нет, начинаем с 'unspecified'
+                                          # или можно сделать случайный выбор, но лучше по умолчанию.
 
             global_player_profile = Player(
                 user_id=user_id,
@@ -1253,21 +1257,42 @@ async def ensure_player_profile_exists(session: AsyncSession, user_id: int, user
                 total_kills=0,
                 total_deaths=0,
                 level=1,
-                experience=0
+                experience=0,
+                # game_id и last_played_group_id должны быть None по умолчанию для глобального профиля
+                # (они nullable=True в модели, так что это нормально)
             )
             session.add(global_player_profile)
-            await session.flush() # Используем await
             logging.info(f"Created global player profile for {full_name} ({user_id}).")
         else:
-            global_player_profile.username = username
-            global_player_profile.full_name = full_name
-            session.add(global_player_profile)
+            # Глобальный профиль существует, обновляем его данные
+            needs_update = False
+            if global_player_profile.username != username:
+                global_player_profile.username = username
+                needs_update = True
+            if global_player_profile.full_name != full_name:
+                global_player_profile.full_name = full_name
+                needs_update = True
+            
+            if needs_update:
+                logging.info(f"Updated global player profile for {full_name} ({user_id}).")
+            # НЕТ НУЖДЫ В session.add(global_player_profile) здесь, объект уже отслеживается.
+            # Если вы хотите сохранить логику, что gender мог быть установлен в игре, 
+            # а теперь перенесен в глобальный профиль, то:
+            # if global_player_profile.gender == 'unspecified':
+            #     # Это может быть логика для переноса пола из игрового контекста в глобальный, 
+            #     # если игрок играл, и там был установлен пол.
+            #     # В текущей реализации gender для нового профиля будет 'unspecified'.
+            #     # Если вы хотите, чтобы global_player_profile.gender обновлялся из player_gender
+            #     # который вычисляется в cmd_new_game, то global_player_profile.gender = player_gender (из cmd_new_game)
+            #     # а не здесь.
+            pass # Если никаких других глобальных обновлений не требуется, то этот else просто пропускает add.
 
         return global_player_profile
     except Exception as e:
         logging.error(f"ERROR: Exception in ensure_player_profile_exists for user {user_id}: {e}", exc_info=True)
-        return None # rollback будет сделан middleware
-
+        # Важно: здесь не нужно делать session.rollback(), так как эта функция 
+        # вызывается внутри более крупной транзакции, которая этим управляет.
+        return None # rollback будет сделан middleware или cmd_new_game
 async def cmd_start(message: Message, command: Command, session: AsyncSession):
     async with AsyncSessionLocal() as session:
         try:
@@ -1280,7 +1305,8 @@ async def cmd_start(message: Message, command: Command, session: AsyncSession):
             await session.commit() # Сохраняем создание/обновление глобального профиля
 
             if message.chat.type == ChatType.PRIVATE:
-                await display_player_profile(message, player_data)
+                await display_player_profile(message, player_data, session) # Передаем session
+
                 # Если игрок мертв и застрял в FSM, очищаем его состояние
                 # Здесь player_data - это глобальный профиль, у него нет is_alive
                 # Нужно искать игрока в текущей игре, если она есть.
@@ -1459,6 +1485,7 @@ async def cmd_help(message: Message):
 
 
  
+
 async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: AsyncSession):
     """
     Обрабатывает команду /new_game.
@@ -1472,141 +1499,126 @@ async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: A
         return
 
     try:
+        with session.sync_session.no_autoflush: # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
         # Получаем данные пользователя из сообщения Telegram
-        user_id = message.from_user.id
-        username = message.from_user.username
-        full_name = message.from_user.full_name
+            user_id = message.from_user.id
+            username = message.from_user.username
+            full_name = message.from_user.full_name
 
         # Используйте GLOBAL_BOT_ID, который вы получили ранее
-        global_player = await ensure_player_profile_exists(
-            session=session,
-            user_id=user_id,
-            username=username,
-            full_name=full_name,
-            bot_id=BOT_ID # <--- ИСПРАВЛЕНИЕ ЗДЕСЬ: ИСПОЛЬЗУЙТЕ 'bot_id'
-        )
-        # 3. Ищем ЛЮБУЮ игру с этим chat_id, независимо от статуса
-        result_game_any_status = await session.execute(select(Game).filter_by(chat_id=message.chat.id))
-        existing_game_any_status = result_game_any_status.scalars().first()
-
-        should_create_new_game = True
-        game_to_use = None
-
-        if existing_game_any_status:
-            # Если найдена игра, проверяем ее статус
-            if existing_game_any_status.status in ['waiting', 'playing']:
-                game_to_use = existing_game_any_status
-                should_create_new_game = False
-                logging.info(f"Existing active/waiting game {{game_to_use.id}} found for chat {{message.chat.id}}. Updating message.")
-            else:
-                # Если игра неактивна (например, 'finished', 'cancelled'), удаляем ее
-                logging.info(f"Found non-active game {{existing_game_any_status.id}} (status: {{existing_game_any_status.status}}) for chat {{message.chat.id}}. Deleting it.")
-                
-                # Удаляем запланированные задачи, если есть (если scheduler глобальный)
-                for job in scheduler.get_jobs():
-                    if job.args and job.args[0] == existing_game_any_status.id:
-                        job.remove()
-                        logging.info(f"All scheduled jobs for game {{existing_game_any_status.id}} removed during deletion.")
-                
-                # Попытка удалить старое сообщение регистрации игры
-                if existing_game_any_status.start_message_id:
-                    try:
-                        await bot.delete_message(chat_id=existing_game_any_status.chat_id, message_id=existing_game_any_status.start_message_id)
-                        logging.info(f"Deleted old start message {{existing_game_any_status.start_message_id}} for game {{existing_game_any_status.id}}.")
-                    except (TelegramBadRequest, TelegramForbiddenError) as e:
-                        logging.warning(f"Could not delete old start message {{existing_game_any_status.start_message_id}} for game {{existing_game_any_status.id}} for chat {{message.chat.id}}: {{e}}. Sending new message.", exc_info=True)
-                    except Exception as e:
-                        logging.error(f"Unknown error deleting old start message {{existing_game_any_status.start_message_id}} for game {{existing_game_any_status.id}} for chat {{message.chat.id}}: {{e}}", exc_info=True)
-                
-                await session.delete(existing_game_any_status) # Удаляем старую запись игры
-                await session.commit() # Фиксируем удаление
-                logging.info(f"Old game {{existing_game_any_status.id}} (status: {{existing_game_any_status.status}}) for chat {{message.chat.id}} successfully deleted.")
-
-        if should_create_new_game:
-            # Если нужно создать новую игру
-            new_game = Game(chat_id=message.chat.id, status='waiting')
-            session.add(new_game)
-            await session.flush() # Принудительно получаем ID для новой игры
-            game_to_use = new_game
-            logging.info(f"New game {{game_to_use.id}} created for chat {{message.chat.id}}.")
-
-        # 4. Создание или получение Группы (Города) для чата
-        result_group = await session.execute(select(Group).filter_by(chat_id=message.chat.id))
-        group = result_group.scalars().first()
-        if not group:
-            chat_info = await bot.get_chat(message.chat.id)
-            group_name = chat_info.title if chat_info.title else f"Группа {{message.chat.id}}"
-            group = Group(chat_id=message.chat.id, name=group_name)
-            session.add(group)
-            await session.flush() # Получаем ID новой группы до коммита
-            logging.info(f"New Group {{group.name}} (ID: {{group.id}}) created for chat {{message.chat.id}}.")
-        
-        # 5. Обработка игрока (регистрация или обновление в текущей игре)
-        # Обновляем last_played_group_id для текущего глобального игрока
-        global_player.last_played_group_id = group.id
-        
-        # Определяем пол игрока (используем глобальный профиль или случайный выбор)
-        player_gender = global_player.gender if global_player.gender != 'unspecified' else random.choice(['male', 'female'])
-
-        # --- НАЧАЛО ИСПРАВЛЕНИЯ IntegrityError (для Player в контексте игры) ---
-        # Проверяем, существует ли игрок в ЭТОЙ КОНКРЕТНОЙ ИГРЕ
-        result_player_in_game = await session.execute(select(Player).filter_by(
-            user_id=user_id, 
-            game_id=game_to_use.id
-        ))
-        player_in_game_check = result_player_in_game.scalars().first()
-
-        if player_in_game_check:
-            # Игрок уже в этой игре, обновляем его данные
-            player_in_game_check.username = username
-            player_in_game_check.full_name = full_name
-            player_in_game_check.gender = player_gender
-            # Здесь можно обновить другие поля, специфичные для игрока в игре
-            # Например, сбросить роль, если игра начинается заново
-            # player_in_game_check.role = 'civilian' 
-            # player_in_game_check.is_alive = True
-            logging.info(f"Player {{player_in_game_check.full_name}} ({{player_in_game_check.user_id}}) updated in existing game {{game_to_use.id}}.")
-            await message.reply("Вы уже присоединились к этой игре! Ваши данные обновлены.")
-        else:
-            # Игрока нет в этой игре, добавляем его
-            player = Player(
-                user_id=user_id, # Используем user_id напрямую
+        # Эта функция должна найти СУЩЕСТВУЮЩИЙ профиль Player или создать его, если его нет.
+        # global_player - это объект Player из БД, представляющий этого пользователя.
+            global_player = await ensure_player_profile_exists(
+                session=session,
+                user_id=user_id,
                 username=username,
                 full_name=full_name,
-                game_id=game_to_use.id,
-                gender=player_gender,
-                last_played_group_id=group.id,
-                # !!! ВАЖНО: Добавьте остальные обязательные поля для Player здесь !!!
-                # Например:
-                # role='civilian', is_alive=True, voted_for_player_id=None,
-                # night_action_target_id=None, selected_title='default',
-                # unlocked_frames=['default'], unlocked_titles=['default'],
-                # total_games=0, total_wins=0, total_kills=0, total_deaths=0,
-                # level=1, experience=0, dollars=0, diamonds=0
+                bot_id=BOT_ID # <--- ИСПРАВЛЕНИЕ ЗДЕСЬ: ИСПОЛЬЗУЙТЕ 'bot_id'
             )
-            session.add(player)
-            logging.info(f"Player {{player.full_name}} ({{player.user_id}}) created and joined new game {{game_to_use.id}}.")
-            await message.reply("Вы успешно присоединились к игре!")
-        # --- КОНЕЦ ИСПРАВЛЕНИЯ IntegrityError ---
 
+            # 3. Ищем ЛЮБУЮ игру с этим chat_id, независимо от статуса
+            result_game_any_status = await session.execute(select(Game).filter_by(chat_id=message.chat.id))
+            existing_game_any_status = result_game_any_status.scalars().first()
+
+            should_create_new_game = True
+            game_to_use = None
+
+            if existing_game_any_status:
+                # Если найдена игра, проверяем ее статус
+                if existing_game_any_status.status in ['waiting', 'playing']:
+                    game_to_use = existing_game_any_status
+                    should_create_new_game = False
+                    logging.info(f"Existing active/waiting game {game_to_use.id} found for chat {message.chat.id}. Updating message.")
+                else:
+                    # Если игра неактивна (например, 'finished', 'cancelled'), удаляем ее
+                    logging.info(f"Found non-active game {existing_game_any_status.id} (status: {existing_game_any_status.status}) for chat {message.chat.id}. Deleting it.")
+                    
+                    # Удаляем запланированные задачи, если есть (если scheduler глобальный)
+                    for job in scheduler.get_jobs():
+                        if job.args and job.args[0] == existing_game_any_status.id:
+                            job.remove()
+                            logging.info(f"All scheduled jobs for game {existing_game_any_status.id} removed during deletion.")
+                    
+                    # Попытка удалить старое сообщение регистрации игры
+                    if existing_game_any_status.start_message_id:
+                        try:
+                            await bot.delete_message(chat_id=existing_game_any_status.chat_id, message_id=existing_game_any_status.start_message_id)
+                            logging.info(f"Deleted old start message {existing_game_any_status.start_message_id} for game {existing_game_any_status.id}.")
+                        except (TelegramBadRequest, TelegramForbiddenError) as e:
+                            logging.warning(f"Could not delete old start message {existing_game_any_status.start_message_id} for game {existing_game_any_status.id} for chat {message.chat.id}: {e}. Sending new message.", exc_info=True)
+                        except Exception as e:
+                            logging.error(f"Unknown error deleting old start message {existing_game_any_status.start_message_id} for game {existing_game_any_status.id} for chat {message.chat.id}: {e}", exc_info=True)
+                    
+                    await session.delete(existing_game_any_status) # Удаляем старую запись игры
+                    await session.commit() # Фиксируем удаление
+                    logging.info(f"Old game {existing_game_any_status.id} (status: {existing_game_any_status.status}) for chat {message.chat.id} successfully deleted.")
+
+            if should_create_new_game:
+                # Если нужно создать новую игру
+                new_game = Game(chat_id=message.chat.id, status='waiting')
+                session.add(new_game)
+                await session.flush() # Принудительно получаем ID для новой игры
+                game_to_use = new_game
+                logging.info(f"New game {game_to_use.id} created for chat {message.chat.id}.")
+
+            # 4. Создание или получение Группы (Города) для чата
+            result_group = await session.execute(select(Group).filter_by(chat_id=message.chat.id))
+            group = result_group.scalars().first()
+            if not group:
+                chat_info = await bot.get_chat(message.chat.id)
+                group_name = chat_info.title if chat_info.title else f"Группа {message.chat.id}"
+                group = Group(chat_id=message.chat.id, name=group_name)
+                session.add(group)
+                await session.flush() # Получаем ID новой группы до коммита
+                logging.info(f"New Group {group.name} (ID: {group.id}) created for chat {message.chat.id}.")
+            
+            # 5. Обработка игрока: используем global_player и обновляем его поля для текущей игры
+            # Обновляем last_played_group_id для текущего глобального игрока
+            global_player.last_played_group_id = group.id
+            
+            # Определяем пол игрока (используем глобальный профиль)
+            # Если в global_player.gender 'unspecified', случайный выбор будет сделан при первом создании,
+            # а затем будет храниться в глобальном профиле.
+            # Здесь мы просто берем gender из global_player.
+            player_gender = global_player.gender # Уже установлен или по умолчанию в ensure_player_profile_exists
+
+            # --- ИСПРАВЛЕНИЕ IntegrityError: Обновляем global_player вместо создания нового ---
+            # НЕ НУЖНО ПРОВЕРЯТЬ, СУЩЕСТВУЕТ ЛИ ИГРОК "В ЭТОЙ ИГРЕ" ОТДЕЛЬНО, 
+            # ТАК КАК Player ЯВЛЯЕТСЯ ГЛОБАЛЬНЫМ ПРОФИЛЕМ.
+            # Просто обновите поля global_player, связанные с текущей игрой.
+            
+            # Обновляем поля global_player для этой конкретной игры
+            global_player.game_id = game_to_use.id # Привязываем игрока к текущей игре
+            global_player.role = "Создатель"      # Устанавливаем роль (например, создатель)
+            global_player.is_alive = True         # Сброс статуса жизни
+            global_player.voted_for_player_id = None # Сброс голосования
+            global_player.night_action_target_id = None # Сброс цели ночного действия
+            global_player.username = username     # Обновляем username, если он изменился
+            global_player.full_name = full_name   # Обновляем full_name, если он изменился
+            global_player.gender = player_gender  # Убеждаемся, что пол актуален
+
+            logging.info(f"Player {global_player.full_name} ({global_player.user_id}) updated for game {game_to_use.id}.")
+            await message.reply("Вы присоединились к игре! Ваши данные обновлены/зарегистрированы.")
+            # --- КОНЕЦ ИСПРАВЛЕНИЯ IntegrityError ---
+           
         await session.commit() # Фиксируем все изменения (игрока, игры, группы, глобального профиля)
 
         # 6. Подготовка и отправка сообщения о регистрации игры
         result_players_in_game = await session.execute(select(Player).filter_by(game_id=game_to_use.id))
         players_in_game = result_players_in_game.scalars().all()
         num_players = len(players_in_game)
-        player_names_list = [f"<a href='tg://user?id={{p.user_id}}'>{{p.full_name}}</a>" for p in players_in_game]
+        player_names_list = [f"<a href='tg://user?id={p.user_id}'>{p.full_name}</a>" for p in players_in_game]
         player_list_str = "\n".join(player_names_list) if player_names_list else "Пока нет игроков. {FACTION_EMOJIS['missed']}"
 
         result_organizer = await session.execute(select(Player).filter_by(game_id=game_to_use.id).order_by(Player.id))
         organizer = result_organizer.scalars().first()
-        organizer_link = f"<a href='tg://user?id={{organizer.user_id}}'>{{organizer.full_name}}</a>" if organizer else "Неизвестный организатор"
+        organizer_link = f"<a href='tg://user?id={organizer.user_id}'>{organizer.full_name}</a>" if organizer else "Неизвестный организатор"
 
         message_text_to_send = (
-            f"Игpа в Мафию {'(создана)' if should_create_new_game else 'ожидается'}! {FACTION_EMOJIS['day']}\n"
+            f"Игpа в Мафию {'(создана)' if should_create_new_game else 'ожидается'}! {PHASE_EMOJIS['day']}\n" 
             f"Организатор: {organizer_link}\n"
-            f"Текущее количество игроков: <b>{{num_players}}</b>/{{MIN_PLAYERS_TO_START}}.\n"
-            f"Участники:\n{{player_list_str}}\n"
+            f"Текущее количество игроков: <b>{num_players}</b>/{MIN_PLAYERS_TO_START}.\n"
+            f"Участники:\n{player_list_str}\n"
             f"Чтобы присоединиться или начать игру, используйте кнопки ниже."
         )
 
@@ -1619,7 +1631,6 @@ async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: A
         if game_to_use.start_message_id:
             try:
                 # Попытка обновить существующее сообщение
-                # edit_message_text возвращает Message, можно получить его message_id
                 sent_message = await bot.edit_message_text(
                     chat_id=message.chat.id,
                     message_id=game_to_use.start_message_id,
@@ -1627,10 +1638,10 @@ async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: A
                     reply_markup=keyboard,
                     parse_mode=ParseMode.HTML
                 )
-                logging.info(f"Updated existing game {{game_to_use.id}} registration message (ID: {{game_to_use.start_message_id}}).")
+                logging.info(f"Updated existing game {game_to_use.id} registration message (ID: {game_to_use.start_message_id}).")
             except (TelegramBadRequest, TelegramForbiddenError) as e:
                 # Если не удалось обновить (например, сообщение удалено), отправляем новое
-                logging.warning(f"Could not edit existing game registration message (game_to_use.start_message_id) for chat {{message.chat.id}}: {{e}}. Sending new message.", exc_info=True)
+                logging.warning(f"Could not edit existing game registration message ({game_to_use.start_message_id}) for chat {message.chat.id}: {e}. Sending new message.", exc_info=True)
                 
                 # Удаляем старый ID сообщения и отправляем новое
                 game_to_use.start_message_id = None
@@ -1646,9 +1657,9 @@ async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: A
                 game_to_use.start_message_id = sent_message.message_id
                 session.add(game_to_use)
                 await session.commit() # Фиксируем новый start_message_id
-                logging.info(f"Sent new game registration message (sent_message.message_id) for game {{game_to_use.id}}.")
+                logging.info(f"Sent new game registration message ({sent_message.message_id}) for game {game_to_use.id}.")
             except Exception as e:
-                logging.error(f"Unknown error editing existing game registration message (game_to_use.start_message_id) for game {{game_to_use.id}} for chat {{message.chat.id}}: {{e}}", exc_info=True)
+                logging.error(f"Unknown error editing existing game registration message ({game_to_use.start_message_id}) for game {game_to_use.id} for chat {message.chat.id}: {e}", exc_info=True)
                 
                 # Если произошла другая ошибка при обновлении, также отправляем новое
                 game_to_use.start_message_id = None
@@ -1663,7 +1674,7 @@ async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: A
                 game_to_use.start_message_id = sent_message.message_id
                 session.add(game_to_use)
                 await session.commit()
-                logging.info(f"Sent new game registration message (sent_message.message_id) for game {{game_to_use.id}} due to previous error.")
+                logging.info(f"Sent new game registration message ({sent_message.message_id}) for game {game_to_use.id} due to previous error.")
         else:
             # Если start_message_id нет, отправляем новое сообщение
             sent_message = await bot.send_message(
@@ -1675,12 +1686,12 @@ async def cmd_new_game(message: Message, state: FSMContext, bot: Bot, session: A
             game_to_use.start_message_id = sent_message.message_id
             session.add(game_to_use)
             await session.commit()
-            logging.info(f"Sent new game registration message (sent_message.message_id) for game {{game_to_use.id}}.")
+            logging.info(f"Sent new game registration message ({sent_message.message_id}) for game {game_to_use.id}.")
 
     except Exception as e:
-        logging.error(f"Критическая ошибка в cmd_new_game для чата {{message.chat.id}}: {{e}}", exc_info=True)
+        logging.error(f"Критическая ошибка в cmd_new_game для чата {message.chat.id}: {e}", exc_info=True)
         await session.rollback() # Откатываем все изменения в случае критической ошибки (для AsyncSession)
-        await message.reply(f"Произошла ошибка при создании игры. Попробуйте позже. {{FACTION_EMOJIS['missed']}}")
+        await message.reply(f"Произошла ошибка при создании игры. Попробуйте позже. {FACTION_EMOJIS['missed']}")
 async def cmd_join(message: Message):
     """
     Обрабатывает команду /join.
@@ -1717,7 +1728,7 @@ async def cmd_join(message: Message):
 
 
  
-async def callback_join_game(query: CallbackQuery):
+async def callback_join_game(query: types.CallbackQuery, game_id: int, session: AsyncSession):
      
         try:
             # Всегда гарантируем, что у игрока есть глобальный профиль
