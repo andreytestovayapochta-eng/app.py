@@ -27,7 +27,7 @@ from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery, Update # Убедитесь, что Update импортирован
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker # Если вы используете асинхронную SQLAlchemy
 from sqlalchemy.orm import Session as SyncSession # Если вы используете синхронную SQLAlchemy
-from database import init_db, Session, Game, Player, Group
+from database import Player, Game, Group, Base, AsyncSessionLocal # Добавьте AsyncSessionLocal
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update # Update нужен для Middleware
 from sqlalchemy import select # Очень важно для асинхронных запросов
 from sqlalchemy.orm import declarative_base
@@ -151,11 +151,10 @@ def format_group_info(group_obj: Group) -> str:
 # --- КОНЕЦ НОВОЙ ВСПОМОГАТЕЛЬНОЙ ФУНКЦИИ ---
 
 # --- Вспомогательные функции для смены фаз ---
-async def end_day_phase(game_id: int):
-    """Завершает фазу дня и начинает фазу голосования."""
-    with Session() as session:
+async def end_day_phase(game_id: int): # <--- Убрать `session: AsyncSession` из аргументов
+    async with AsyncSessionLocal() as session: # <--- ВОССТАНОВИТЬ ЭТУ СТРОКУ
         try:
-            game = session.get(Game, game_id)
+            game = await session.get(Game, game_id)
             if not game or game.status != 'playing' or game.phase != 'day':
                 logging.warning(f"end_day_phase: Game {game_id} not in day phase or not playing (status={game.status}, phase={game.phase}).")
                 return
@@ -163,11 +162,13 @@ async def end_day_phase(game_id: int):
             game.phase = 'voting'
             game.phase_end_time = datetime.datetime.now() + datetime.timedelta(seconds=PHASE_DURATIONS['voting'])
             session.add(game)
-            session.commit()
+            await session.commit()
             logging.info(f"Game {game_id} transitioned to 'voting' phase.")
 
-            players_alive_in_game = session.query(Player).filter_by(game_id=game.id, is_alive=True).all()
-
+            players_alive_in_game_result = await session.execute(
+                select(Player).filter_by(game_id=game.id, is_alive=True)
+            )
+            players_alive_in_game = players_alive_in_game_result.scalars().all()
             for player_in_game in players_alive_in_game:
                 keyboard_buttons = []
                 possible_targets = [p for p in players_alive_in_game if p.id != player_in_game.id]
@@ -224,26 +225,24 @@ async def end_day_phase(game_id: int):
                 parse_mode=ParseMode.HTML
             )
 
-            scheduler.add_job(end_voting_phase, 'date', run_date=game.phase_end_time, args=[game_id],
+            scheduler.add_job(end_voting_phase, 'date', run_date=game.phase_end_time, args=[game_id], # <--- Удалить `session` из args
                               id=f"end_voting_game_{game_id}")
             logging.info(f"Scheduled end_voting_phase for game {game_id} at {game.phase_end_time}")
 
         except Exception as e:
             logging.error(f"Ошибка в end_day_phase для game_id {game_id}: {e}", exc_info=True)
-            session.rollback()
-
-
+            await session.rollback()
 async def end_voting_phase(game_id: int):
     """Завершает фазу голосования, обрабатывает голоса и начинает фазу казни."""
-    with Session() as session:
+    async with AsyncSessionLocal() as session:
         try:
-            game = session.get(Game, game_id)
+            game = await session.get(Game, game_id)
             if not game or game.status != 'playing' or game.phase != 'voting':
                 logging.warning(f"end_voting_phase: Game {game_id} not in voting phase or not playing.")
                 return
 
-            players = session.query(Player).filter_by(game_id=game.id, is_alive=True).all()
-
+            result = await session.execute(select(Player).filter_by(game_id=game.id, is_alive=True))
+            players = result.scalars().all()
             vote_counts = {}
             for voter in players:
                 if voter.voted_for_player_id:
@@ -278,7 +277,7 @@ async def end_voting_phase(game_id: int):
                     game.lynch_vote_dislikes = 0
                     game.phase_end_time = datetime.datetime.now() + datetime.timedelta(seconds=PHASE_DURATIONS['lynch_vote'])
                     session.add(game)
-                    session.commit()
+                    await session.commit()
                     logging.info(f"Game {game_id} transitioned to 'lynch_vote' phase for player {player_to_lynch.full_name}.")
                     
                     keyboard_lynch = InlineKeyboardMarkup(inline_keyboard=[
@@ -301,7 +300,7 @@ async def end_voting_phase(game_id: int):
                     game.lynch_message_id = lynch_msg.message_id
                     game.lynch_voters = ""
                     session.add(game)
-                    session.commit()
+                    await session.commit()
                     logging.info(f"Game {game_id} transitioned to 'lynch_vote' phase for player {player_to_lynch.full_name}.")
                     scheduler.add_job(end_lynch_voting_phase, 'date', run_date=game.phase_end_time, args=[game_id],
                                       id=f"end_lynch_vote_game_{game_id}")
@@ -320,13 +319,13 @@ async def end_voting_phase(game_id: int):
 
         except Exception as e:
             logging.error(f"Ошибка в end_voting_phase для game_id {game_id}: {e}", exc_info=True)
-            session.rollback()
+            await session.rollback()
 
 async def end_lynch_voting_phase(game_id: int):
     """Завершает фазу голосования за казнь, обрабатывает голоса и начинает фазу ночи."""
-    with Session() as session:
+    async with AsyncSessionLocal() as session:
         try:
-            game = session.get(Game, game_id)
+            game = await session.get(Game, game_id) # <-- ИЗМЕНИЛИ
             if not game or game.status != 'playing' or game.phase != 'lynch_vote':
                 logging.warning(f"end_lynch_voting_phase: Game {game_id} not in lynch_vote phase or not playing.")
                 return
@@ -365,12 +364,12 @@ async def end_lynch_voting_phase(game_id: int):
 
                 await send_death_notification_and_farewell_prompt(executed_player.user_id, executed_player.game_id,
                                                                   executed_player.role, executed_player.full_name)
-                session.commit() # Коммит после смерти, чтобы check_win_condition видел актуальное состояние
+                await session.commit() # Коммит после смерти, чтобы check_win_condition видел актуальное состояние
                 if await check_win_condition(game.id, session):
                     game_ended_after_lynch = True
                 else:
                     execution_message = f"Жители решили помиловать <a href='tg://user?id={executed_player.user_id}'><b>{executed_player.full_name}</b></a>. Он остается жить! {RESULT_EMOJIS['saved']}"
-                    session.commit() # Коммит, чтобы сохранить статус игры
+                    await session.commit()  # Коммит, чтобы сохранить статус игры
 
             await bot.send_message(
                 chat_id=game.chat_id,
@@ -400,22 +399,23 @@ async def end_lynch_voting_phase(game_id: int):
 
         except Exception as e:
             logging.error(f"Ошибка в end_lynch_voting_phase для game_id {game_id}: {e}", exc_info=True)
-            session.rollback()
+            await session.rollback()
 
 
-async def prepare_for_night_phase(game_id: int, session):
+async def prepare_for_night_phase(game_id: int, session: AsyncSession):
     """Общая функция для перехода к ночной фазе."""
-    game = session.get(Game, game_id)
+    game = await session.get(Game, game_id) # <-- ИЗМЕНИЛИ
     if not game:
         logging.warning(f"prepare_for_night_phase: Game {game_id} not found.")
         return
 
     # Сброс флагов голосования для всех живых игроков перед новой ночью/днем
-    players_to_reset_votes = session.query(Player).filter_by(game_id=game.id, is_alive=True).all()
+    result = await session.execute(select(Player).filter_by(game_id=game.id, is_alive=True))
+    players_to_reset_votes = result.scalars().all()
     for p in players_to_reset_votes:
         p.voted_for_player_id = None
         session.add(p)
-    session.commit()
+    await session.commit()
     logging.info(f"Players' votes reset for game {game.id} before new night.")
 
     game.current_day += 1 # День увеличивается перед ночью
@@ -428,7 +428,7 @@ async def prepare_for_night_phase(game_id: int, session):
     game.lynch_voters = ""
 
     session.add(game)
-    session.commit()
+    await session.commit()
     logging.info(f"Game {game_id} transitioned to 'night' phase {game.current_day}.")
 
     await start_night_phase(game.id)
@@ -439,15 +439,15 @@ async def prepare_for_night_phase(game_id: int, session):
 
 async def start_night_phase(game_id: int):
     """Отправляет кнопки ночных действий игрокам с ролями в ЛС."""
-    with Session() as session:
-        try:
-            game = session.get(Game, game_id)
+     
+    try:
+            game = await session.get(Game, game_id) 
             if not game or game.status != 'playing' or game.phase != 'night':
                 logging.warning(f"start_night_phase: Game {game_id} not in night phase or not playing.")
                 return
 
-            players_alive = session.query(Player).filter_by(game_id=game.id, is_alive=True).all()
-
+            result_players_alive = await session.execute(select(Player).filter_by(game_id=game.id, is_alive=True))
+            players_alive = result_players_alive.scalars().all()
             for p in players_alive:
                 p.night_action_target_id = None
                 session.add(p)
@@ -455,7 +455,7 @@ async def start_night_phase(game_id: int):
                 if p.role not in ['mafia', 'don']:
                     state = dp.fsm.get_context(bot=bot, chat_id=p.user_id, user_id=p.user_id)
                     await state.clear()
-            session.commit()
+            await session.commit() 
             logging.info(f"Night actions reset and FSM cleared for non-mafia/don players in game {game.id}.")
 
             for player in players_alive:
@@ -564,15 +564,15 @@ async def start_night_phase(game_id: int):
                     parse_mode=ParseMode.HTML
                 )
 
-        except Exception as e:
-            logging.error(f"Ошибка в start_night_phase (отправка кнопок) для game_id {game_id}: {e}", exc_info=True)
-            session.rollback()
+    except Exception as e:
+        logging.error(f"Ошибка в start_night_phase (отправка кнопок) для game_id {game_id}: {e}", exc_info=True)
+        await session.rollback()
 
 async def end_night_phase_processing(game_id: int):
     """Завершает ночную фазу, обрабатывает действия ролей и начинает новый день."""
-    with Session() as session:
+    async with AsyncSessionLocal() as session:
         try:
-            game = session.get(Game, game_id)
+            game = await session.get(Game, game_id)
             if not game or game.status != 'playing' or game.phase != 'night':
                 logging.warning(f"end_night_phase_processing: Game {game_id} not in night phase or not playing (status={game.status}, phase={game.phase}).")
                 return
@@ -584,9 +584,11 @@ async def end_night_phase_processing(game_id: int):
             commissioner_target_id = None
             maniac_target_id = None
 
-            mafia_players = session.query(Player).filter_by(game_id=game.id, is_alive=True, role='mafia').all()
-            don_player = session.query(Player).filter_by(game_id=game.id, is_alive=True, role='don').first()
-
+            result_mafia_players = await session.execute(select(Player).filter_by(game_id=game.id, is_alive=True, role='mafia'))
+            mafia_players = result_mafia_players.scalars().all()
+            
+            result_don_player = await session.execute(select(Player).filter_by(game_id=game.id, is_alive=True, role='don'))
+            don_player = result_don_player.scalars().first()
             # ЛОГИКА ГОЛОСОВАНИЯ МАФИИ: Приоритет Дону, затем большинство
             if don_player and don_player.night_action_target_id:
                 mafia_target_id = don_player.night_action_target_id
@@ -615,15 +617,18 @@ async def end_night_phase_processing(game_id: int):
                         mafia_target_id = random.choice(mafia_targets_with_max_votes)
                         logging.info(f"Mafia targets tied in game {game.id}. Randomly chose {mafia_target_id}.")
                         
-            doctor_player = session.query(Player).filter_by(game_id=game.id, is_alive=True, role='doctor').first()
+            result_doctor_player = await session.execute(select(Player).filter_by(game_id=game.id, is_alive=True, role='doctor'))
+            doctor_player = result_doctor_player.scalars().first()
             if doctor_player and doctor_player.night_action_target_id:
                 doctor_target_id = doctor_player.night_action_target_id
 
-            commissioner_player = session.query(Player).filter_by(game_id=game.id, is_alive=True, role='commissioner').first()
+            result_commissioner_player = await session.execute(select(Player).filter_by(game_id=game.id, is_alive=True, role='commissioner'))
+            commissioner_player = result_commissioner_player.scalars().first()
             if commissioner_player and commissioner_player.night_action_target_id:
                 commissioner_target_id = commissioner_player.night_action_target_id
 
-            maniac_player = session.query(Player).filter_by(game_id=game.id, is_alive=True, role='maniac').first()
+            result_maniac_player = await session.execute(select(Player).filter_by(game_id=game.id, is_alive=True, role='maniac'))
+            maniac_player = result_maniac_player.scalars().first()
             if maniac_player and maniac_player.night_action_target_id:
                 maniac_target_id = maniac_player.night_action_target_id
 
@@ -690,7 +695,7 @@ async def end_night_phase_processing(game_id: int):
                         maniac_player.total_kills = (maniac_player.total_kills or 0) + 1
                         session.add(maniac_player)
                     
-                    session.commit()
+                    await session.commit()
                     logging.info(f"Player {player_obj.full_name} was killed in game {game.id}.")
 
                     await send_death_notification_and_farewell_prompt(player_obj.user_id,
@@ -811,7 +816,7 @@ async def end_night_phase_processing(game_id: int):
             game.phase = 'day'
             game.phase_end_time = datetime.datetime.now() + datetime.timedelta(seconds=PHASE_DURATIONS['day'])
             session.add(game)
-            session.commit()
+            await session.commit()
             logging.info(f"Game {game.id} transitioned to 'day' phase {game.current_day}.")
 
             caption_text = (
@@ -931,21 +936,22 @@ async def end_night_phase_processing(game_id: int):
 
         except Exception as e:
             logging.error(f"Ошибка в end_night_phase_processing для game_id {game_id}: {e}", exc_info=True)
-            session.rollback()
+            await session.commit()
                         
 
-async def check_win_condition(game_id: int, session) -> bool:
+async def check_win_condition(game_id: int, session: AsyncSession) -> bool:
     """
     Проверяет, выполнено ли условие победы для какой-либо из сторон.
     Возвращает True, если игра завершена, False в противном случае.
     """
     logging.info(f"Checking win condition for game {game_id}")
-    game = session.get(Game, game_id)
+    game = await session.get(Game, game_id) 
     if not game or game.status != 'playing':
         logging.info(f"Game {game.id} not playing, skipping win check.")
         return False
 
-    players_alive = session.query(Player).filter_by(game_id=game.id, is_alive=True).all()
+    result_players_alive = await session.execute(select(Player).filter_by(game_id=game.id, is_alive=True))
+    players_alive = result_players_alive.scalars().all()
     
     num_mafia_alive = len([p for p in players_alive if p.role in ['mafia', 'don']])
     num_town_alive = len([p for p in players_alive if p.role in ['civilian', 'doctor', 'commissioner']])
@@ -962,17 +968,20 @@ async def check_win_condition(game_id: int, session) -> bool:
     if num_maniac_alive > 0 and num_maniac_alive >= num_total_alive - num_maniac_alive:
         winner_message = f"{ROLE_EMOJIS['maniac']} Маньяк победил!"
         game_over = True
-        winning_faction_players = session.query(Player).filter_by(game_id=game.id, role='maniac').all()
+        result_winning_maf_players = await session.execute(select(Player).filter_by(game_id=game.id, role='maniac'))
+        winning_faction_players = result_winning_maf_players.scalars().all()
     # Условие победы Мафии
     elif num_mafia_alive > 0 and num_mafia_alive >= (num_town_alive + num_maniac_alive):
         winner_message = f"{FACTION_EMOJIS['mafia']} Мафия победила!"
         game_over = True
-        winning_faction_players = session.query(Player).filter(Player.game_id == game.id, Player.role.in_(['mafia', 'don'])).all()
+        result_winning_mafia_players = await session.execute(select(Player).filter(Player.game_id == game.id, Player.role.in_(['mafia', 'don'])))
+        winning_faction_players = result_winning_mafia_players.scalars().all()
     # Условие победы Мирных
     elif num_mafia_alive == 0 and num_maniac_alive == 0 and num_town_alive > 0:
         winner_message = f"{FACTION_EMOJIS['town']} Мирные жители победили!"
         game_over = True
-        winning_faction_players = session.query(Player).filter(Player.game_id == game.id, Player.role.in_(['civilian', 'doctor', 'commissioner'])).all()
+        result_winning_town_players = await session.execute(select(Player).filter(Player.game_id == game.id, Player.role.in_(['civilian', 'doctor', 'commissioner'])))
+        winning_faction_players = result_winning_town_players.scalars().all()
     # Ничья (все мертвы)
     elif num_total_alive == 0:
         winner_message = f"{RESULT_EMOJIS['missed']} Никто не выжил. Ничья."
@@ -982,15 +991,17 @@ async def check_win_condition(game_id: int, session) -> bool:
         logging.info(f"Game {game.id} IS OVER! Winner: {winner_message}")
         game_chat_id = game.chat_id
 
-        all_players_in_finished_game = session.query(Player).filter_by(game_id=game_id).all()
+        result_all_players = await session.execute(select(Player).filter_by(game_id=game_id))
+        all_players_in_finished_game = result_all_players.scalars().all()
 
         # Сначала обновляем статус игры в базе данных
         game.status = 'finished'
         session.add(game)
-        session.commit()
+        await session.commit()
         logging.info(f"Game {game.id} status committed as 'finished'.")
         # --- ОБНОВЛЕНИЕ СТАТИСТИКИ ГРУППЫ (ГОРОДА) И ПРИМЕНЕНИЕ БОНУСОВ ---
-        group = session.query(Group).filter_by(chat_id=game.chat_id).first()
+        result_group = await session.execute(select(Group).filter_by(chat_id=game.chat_id))
+        group = result_group.scalars().first()
         if group:
             group.total_games_played += 1
             group.experience += GROUP_EXP_FOR_GAME_END # Базовый опыт за завершение игры
@@ -1042,7 +1053,7 @@ async def check_win_condition(game_id: int, session) -> bool:
             group_bonus_exp_multiplier = 1.0
             group_bonus_dollars_multiplier = 1.0
             
-            player_last_played_group = session.get(Group, player_game_instance.last_played_group_id)
+            player_last_played_group = await session.get(Group, player_game_instance.last_played_group_id)
             if player_last_played_group:
                 group_bonus_exp_multiplier += player_last_played_group.bonus_exp_percent
                 group_bonus_dollars_multiplier += player_last_played_group.bonus_dollars_percent
@@ -1100,7 +1111,7 @@ async def check_win_condition(game_id: int, session) -> bool:
 
             session.add(global_player_profile) # Сохраняем изменения глобального профиля
 
-        session.commit()
+        await session.commit()
         logging.info(f"Player stats committed for game {game.id}.")
 
 
@@ -1127,7 +1138,8 @@ async def check_win_condition(game_id: int, session) -> bool:
         final_summary_text += "\n" + "—" * 20 + "\n"
 
         # Детальная сводка по фракциям
-        all_players_in_game = session.query(Player).filter_by(game_id=game_id).all()
+        result_all_players_in_game = await session.execute(select(Player).filter_by(game_id=game_id))
+        all_players_in_game = result_all_players_in_game.scalars().all()
         mafia_faction_players = [p for p in all_players_in_game if p.role in ['mafia', 'don']]
         civilian_faction_players = [p for p in all_players_in_game if p.role not in ['mafia', 'don', 'maniac']]
         maniac_faction_players = [p for p in all_players_in_game if p.role == 'maniac']
@@ -1178,51 +1190,51 @@ async def check_win_condition(game_id: int, session) -> bool:
     return False
 async def send_death_notification_and_farewell_prompt(user_id: int, game_id: int, role: str, full_name: str):
     """Отправляет уведомление о смерти игроку и предлагает написать прощальное сообщение."""
-    with Session() as session:
-        try:
-            player_role_ru = ROLE_NAMES_RU.get(role, role.capitalize())
-            role_emoji = ROLE_EMOJIS.get(role, "?")
+     
+    try:
+        player_role_ru = ROLE_NAMES_RU.get(role, role.capitalize())
+        role_emoji = ROLE_EMOJIS.get(role, "?")
 
-            await bot.send_message(
-                chat_id=user_id,
-                text=f"{PHASE_EMOJIS['death']} Увы, <a href='tg://user?id={user_id}'>{full_name}</a> ({role_emoji} {player_role_ru}), вы погибли и покинули игру.\n"
-                     f"Вы больше не можете влиять на ход игры, но можете отправить свое последнее прощальное сообщение в общий чат.\n"
-                     f"<b>Напишите ваше прощальное сообщение прямо сюда, в наш личный чат.</b>",
-                parse_mode=ParseMode.HTML
-            )
-            state = dp.fsm.get_context(bot=bot, chat_id=user_id, user_id=user_id)
-            await state.set_state(GameState.waiting_for_farewell_message)
-            await state.update_data(game_id=game_id, player_id=user_id, player_role=role, player_full_name=full_name)
-            logging.info(f"Sent death notification and farewell prompt to player {full_name} ({user_id}) for game {game_id}.")
+        await bot.send_message(
+            chat_id=user_id,
+            text=f"{PHASE_EMOJIS['death']} Увы, <a href='tg://user?id={user_id}'>{full_name}</a> ({role_emoji} {player_role_ru}), вы погибли и покинули игру.\n"
+                    f"Вы больше не можете влиять на ход игры, но можете отправить свое последнее прощальное сообщение в общий чат.\n"
+                    f"<b>Напишите ваше прощальное сообщение прямо сюда, в наш личный чат.</b>",
+            parse_mode=ParseMode.HTML
+        )
+        state = dp.fsm.get_context(bot=bot, chat_id=user_id, user_id=user_id)
+        await state.set_state(GameState.waiting_for_farewell_message)
+        await state.update_data(game_id=game_id, player_id=user_id, player_role=role, player_full_name=full_name)
+        logging.info(f"Sent death notification and farewell prompt to player {full_name} ({user_id}) for game {game_id}.")
 
-        except TelegramForbiddenError:
-            logging.warning(f"Бот заблокирован игроком {full_name} ({user_id}): не удалось отправить уведомление о смерти и запрос прощального сообщения.")
-        except Exception as e:
-            logging.error(f"Ошибка при отправке уведомления о смерти и запросе прощального сообщения игроку {user_id}: {e}", exc_info=True)
+    except TelegramForbiddenError:
+        logging.warning(f"Бот заблокирован игроком {full_name} ({user_id}): не удалось отправить уведомление о смерти и запрос прощального сообщения.")
+    except Exception as e:
+        logging.error(f"Ошибка при отправке уведомления о смерти и запросе прощального сообщения игроку {user_id}: {e}", exc_info=True)
 
 
 # --- НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ensure_player_profile_exists ---
-async def ensure_player_profile_exists(session: AsyncSession, user_id: int, username: str | None, full_name: str, bot_id: int): # <--- ИСПРАВЛЕНИЕ ТУТ: ИСПОЛЬЗУЙТЕ 'bot_id'
-    global BOT_ID # Эта строка, скорее всего, не нужна, если вы передаете bot_id как аргумент.
-                      # Но оставлю её закомментированной, если вы решите её оставить.    if current_bot_id is None: # Используем current_bot_id
-    logging.critical("current_bot_id is None when ensure_player_profile_exists is called.")
-    raise ValueError("current_bot_id cannot be None")
+async def ensure_player_profile_exists(session: AsyncSession, user_id: int, username: str | None, full_name: str, bot_id: int):
+    # Убраны лишние проверки global BOT_ID, так как bot_id передается как аргумент.
+    # Проверка на None для bot_id должна происходить до вызова этой функции.
 
-     
-
-    if bot_id is None: # <--- Используйте 'bot_id' здесь
-        logging.critical("BOT_ID is None when ensure_player_profile_exists is called.")
-        raise ValueError("BOT_ID cannot be None")
-
-
-    if user_id == bot_id: # <--- Используйте 'bot_id' здесь
+    if user_id == bot_id:
         logging.warning(f"WARNING: Attempted to get/create global player profile for bot's own ID ({user_id}). Skipping.")
         return None
 
     try:
-        global_player_profile = session.query(Player).filter_by(user_id=user_id, game_id=None).first()
+        # Используем await session.execute(select(...)) для асинхронных запросов
+        result_global_profile = await session.execute(
+            select(Player).filter_by(user_id=user_id, game_id=None)
+        )
+        global_player_profile = result_global_profile.scalars().first()
+
         if not global_player_profile:
-            any_player_record = session.query(Player).filter_by(user_id=user_id).first()
+            # Ищем любую запись игрока, чтобы получить пол, если он уже установлен в игре
+            result_any_player_record = await session.execute(
+                select(Player).filter_by(user_id=user_id)
+            )
+            any_player_record = result_any_player_record.scalars().first()
             player_gender = any_player_record.gender if any_player_record and any_player_record.gender != 'unspecified' else 'unspecified'
 
             global_player_profile = Player(
@@ -1232,15 +1244,19 @@ async def ensure_player_profile_exists(session: AsyncSession, user_id: int, user
                 gender=player_gender,
                 dollars=0,
                 diamonds=0.0,
-                    # НОВЫЕ ПОЛЯ ДЛЯ КАСТОМИЗАЦИИ
                 selected_frame='default',
                 selected_title='default',
-                unlocked_frames=json.dumps(UNLOCKED_FRAMES_DEFAULT), # Инициализация с дефолтными
-                unlocked_titles=json.dumps(UNLOCKED_TITLES_DEFAULT), # Инициализация с дефолтными
-                    # game_id оставляем None для глобального профиля
+                unlocked_frames=json.dumps(UNLOCKED_FRAMES_DEFAULT),
+                unlocked_titles=json.dumps(UNLOCKED_TITLES_DEFAULT),
+                total_games=0,
+                total_wins=0,
+                total_kills=0,
+                total_deaths=0,
+                level=1,
+                experience=0
             )
             session.add(global_player_profile)
-            session.flush()
+            await session.flush() # Используем await
             logging.info(f"Created global player profile for {full_name} ({user_id}).")
         else:
             global_player_profile.username = username
@@ -1250,19 +1266,18 @@ async def ensure_player_profile_exists(session: AsyncSession, user_id: int, user
         return global_player_profile
     except Exception as e:
         logging.error(f"ERROR: Exception in ensure_player_profile_exists for user {user_id}: {e}", exc_info=True)
-        session.rollback()
-        return None
+        return None # rollback будет сделан middleware
 
-async def cmd_start(message: Message, command: Command):
-    with Session() as session:
+async def cmd_start(message: Message, command: Command, session: AsyncSession):
+    async with AsyncSessionLocal() as session:
         try:
-            player_data = ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ ЗДЕСЬ
+            player_data = await ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: добавлен await
             if player_data is None:
                 logging.error(f"Failed to get/create player profile for user {message.from_user.id}. Possibly bot's own ID.")
                 await message.reply(f"Произошла ошибка при загрузке вашего профиля. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-                session.rollback()
+                await session.rollback()
                 return 
-            session.commit() # Сохраняем создание/обновление глобального профиля
+            await session.commit() # Сохраняем создание/обновление глобального профиля
 
             if message.chat.type == ChatType.PRIVATE:
                 await display_player_profile(message, player_data)
@@ -1270,7 +1285,11 @@ async def cmd_start(message: Message, command: Command):
                 # Здесь player_data - это глобальный профиль, у него нет is_alive
                 # Нужно искать игрока в текущей игре, если она есть.
                 # Изменено: ищем игрока в любой игре, где он участвует, и проверяем его is_alive
-                current_game_player = session.query(Player).filter_by(user_id=message.from_user.id, is_alive=False).order_by(Player.id.desc()).first()
+                result_current_game_player = await session.execute(
+                    select(Player).filter_by(user_id=message.from_user.id, is_alive=False)
+                    .order_by(Player.id.desc())
+                )
+                current_game_player = result_current_game_player.scalars().first()
                 
                 if current_game_player: # Если найдена запись игрока, который мертв
                     state = dp.fsm.get_context(bot=bot, chat_id=message.from_user.id, user_id=message.from_user.id)
@@ -1286,18 +1305,21 @@ async def cmd_start(message: Message, command: Command):
 
                 # Отправка ночных кнопок и FSM для чата при /start в ЛС во время ночи
                 # Здесь нужно искать игрока в активной игре
-                current_game_player = session.query(Player).filter(
-                    Player.user_id == message.from_user.id,
-                    Player.game_id != None, # Ищем привязанную к игре запись
-                    Player.is_alive == True
-                ).order_by(Player.id.desc()).first() # Берем последнюю активную игру
-
-                if current_game_player and current_game_player.game and current_game_player.game.status == 'playing' and current_game_player.game.phase == 'night':
-                    await _send_night_action_buttons_and_faction_chat_if_needed(message.from_user.id)
-
+                result_current_game_player_active = await session.execute(
+                    select(Player).filter(
+                        Player.user_id == message.from_user.id,
+                        Player.game_id != None,
+                        Player.is_alive == True
+                    ).order_by(Player.id.desc())
+                )
+                current_game_player_active = result_current_game_player_active.scalars().first()
+                if current_game_player_active and current_game_player_active.game and current_game_player_active.game.status == 'playing' and current_game_player_active.game.phase == 'night':
+                    await _send_night_action_buttons_and_faction_chat_if_needed(message.from_user.id, session)
                 # Информация о текущей ожидающей игре
-                player_in_waiting_game = session.query(Player).filter(Player.user_id == message.from_user.id, Player.game_id != None, Player.is_alive == True).first()
-
+                result_player_in_waiting_game = await session.execute(
+                    select(Player).filter(Player.user_id == message.from_user.id, Player.game_id != None, Player.is_alive == True)
+                )
+                player_in_waiting_game = result_player_in_waiting_game.scalars().first()
                 if player_in_waiting_game and player_in_waiting_game.game and player_in_waiting_game.game.status == 'waiting':
                     await bot.send_message(
                         chat_id=message.from_user.id,
@@ -1314,101 +1336,105 @@ async def cmd_start(message: Message, command: Command):
         except Exception as e:
             logging.error(f"Ошибка при обработке /start для игрока {message.from_user.id}: {e}", exc_info=True)
             await message.reply(f"Произошла ошибка. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-            session.rollback()
-async def _send_night_action_buttons_and_faction_chat_if_needed(user_id: int):
+            await session.rollback()
+async def _send_night_action_buttons_and_faction_chat_if_needed(user_id: int, session: AsyncSession):
     """Отправляет или напоминает о ночных кнопках и FSM для чата игроку в ЛС, если это необходимо."""
-    with Session() as session:
-        try:
-            # Ищем игрока в текущей активной игре (не глобальный профиль)
-            player = session.query(Player).filter(Player.user_id == user_id,
-                                                  Player.game_id != None,
-                Player.is_alive == True
-            ).order_by(Player.id.desc()).first()
+    try:
+        # Ищем игрока в текущей активной игре (не глобальный профиль)
+        player_result = await session.execute(
+            select(Player).filter(Player.user_id == user_id, Player.game_id != None, Player.is_alive == True)
+            .order_by(Player.id.desc())
+        )
+        player = player_result.scalars().first()
 
-            if not player:
-                return
+        if not player:
+            return
 
-            game = player.game
-            if not game or game.status != 'playing' or game.phase != 'night' or player.role not in ['mafia', 'don', 'doctor', 'commissioner', 'maniac']:
-                return
-            
-            # Если игрок уже совершил действие
-            if player.night_action_target_id is not None:
-                target_player_for_action = session.get(Player, player.night_action_target_id)
-                target_name = target_player_for_action.full_name if target_player_for_action else "неизвестный игрок"
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=f"Напоминаю: Вы уже совершили ночное действие. "
-                         f"Ваш выбор: <b>{target_name}</b>. "
-                         f"Ожидайте утро! {FACTION_EMOJIS['town']}"
-                )
-                # Для мафии, если они уже выбрали, но могут продолжать чатиться, оставляем FSM
-                state = dp.fsm.get_context(bot=bot, chat_id=user_id, user_id=user_id)
-                if player.role in ['mafia', 'don']:
-                    await state.set_state(GameState.waiting_for_faction_message)
-                else:
-                    await state.clear() # Для других ролей можно очистить
-                return
-
-            players_alive = session.query(Player).filter_by(game_id=game.id, is_alive=True).all()
-
-            target_buttons = []
-            keyboard_message = ""
-
-            if player.role == 'mafia' or player.role == 'don':
-                keyboard_message = f"Напомню, что наступила ночь. {ROLE_EMOJIS[player.role]} Выберите, кого Мафия убьет этой ночью:"
-                possible_targets = [p for p in players_alive if p.role not in ['mafia', 'don'] and p.id != player.id]
-                for target in possible_targets:
-                    target_buttons.append(
-                        InlineKeyboardButton(text=target.full_name, callback_data=f"mafia_kill_{game.id}_{target.id}"))
-                
-                # Переводим в состояние для чата фракции
-                state = dp.fsm.get_context(bot=bot, chat_id=user_id, user_id=user_id)
+        # Загружаем связанный объект Game
+        await session.refresh(player, attribute_names=['game'])
+        game = player.game
+        if not game or game.status != 'playing' or game.phase != 'night' or player.role not in ['mafia', 'don', 'doctor', 'commissioner', 'maniac']:
+            return
+        
+        # Если игрок уже совершил действие
+        if player.night_action_target_id is not None:
+            target_player_for_action = await session.get(Player, player.night_action_target_id)
+            target_name = target_player_for_action.full_name if target_player_for_action else "неизвестный игрок"
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"Напоминаю: Вы уже совершили ночное действие. "
+                     f"Ваш выбор: <b>{target_name}</b>. "
+                     f"Ожидайте утро! {FACTION_EMOJIS['town']}"
+            )
+            # Для мафии, если они уже выбрали, но могут продолжать чатиться, оставляем FSM
+            state = dp.fsm.get_context(bot=bot, chat_id=user_id, user_id=user_id)
+            if player.role in ['mafia', 'don']:
                 await state.set_state(GameState.waiting_for_faction_message)
-                await state.update_data(game_id=game.id, player_id=player.id, player_full_name=player.full_name, player_role=player.role)
+            else:
+                await state.clear() # Для других ролей можно очистить
+            return
+
+        players_alive_result = await session.execute(
+            select(Player).filter_by(game_id=game.id, is_alive=True)
+        )
+        players_alive = players_alive_result.scalars().all()
+
+        target_buttons = []
+        keyboard_message = ""
+
+        if player.role == 'mafia' or player.role == 'don':
+            keyboard_message = f"Напомню, что наступила ночь. {ROLE_EMOJIS[player.role]} Выберите, кого Мафия убьет этой ночью:"
+            possible_targets = [p for p in players_alive if p.role not in ['mafia', 'don'] and p.id != player.id]
+            for target in possible_targets:
+                target_buttons.append(
+                    InlineKeyboardButton(text=target.full_name, callback_data=f"mafia_kill_{game.id}_{target.id}"))
+            
+            # Переводим в состояние для чата фракции
+            state = dp.fsm.get_context(bot=bot, chat_id=user_id, user_id=user_id)
+            await state.set_state(GameState.waiting_for_faction_message)
+            await state.update_data(game_id=game.id, player_id=player.id, player_full_name=player.full_name, player_role=player.role)
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"Вы находитесь в закрытом чате Мафии. {FACTION_EMOJIS['mafia']} "
+                     f"Ваши сообщения, отправленные сюда, будут видны только союзникам."
+            )
+
+        elif player.role == 'doctor':
+            keyboard_message = f"Напомню, что наступила ночь. {ROLE_EMOJIS['doctor']} Выберите, кого вы вылечите этой ночью:"
+            possible_targets = players_alive
+            for target in possible_targets:
+                target_buttons.append(
+                    InlineKeyboardButton(text=target.full_name, callback_data=f"doctor_heal_{game.id}_{target.id}"))
+        elif player.role == 'commissioner':
+            keyboard_message = f"Напомню, что наступила ночь. {ROLE_EMOJIS['commissioner']} Выберите, кого вы проверите этой ночью:"
+            possible_targets = [p for p in players_alive if p.id != player.id]
+            for target in possible_targets:
+                target_buttons.append(InlineKeyboardButton(text=target.full_name, callback_data=f"com_check_{game.id}_{target.id}"))
+        elif player.role == 'maniac':
+            keyboard_message = f"Напомню, что наступила ночь. {ROLE_EMOJIS['maniac']} Выберите, кого вы убьете этой ночью:"
+            possible_targets = [p for p in players_alive if p.id != player.id]
+            for target in possible_targets:
+                target_buttons.append(
+                    InlineKeyboardButton(text=target.full_name,
+                                         callback_data=f"maniac_kill_{game.id}_{target.id}"))
+
+        if target_buttons:
+            inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                target_buttons[i:i + 2] for i in range(0, len(target_buttons), 2)
+            ])
+            try:
                 await bot.send_message(
                     chat_id=user_id,
-                    text=f"Вы находитесь в закрытом чате Мафии. {FACTION_EMOJIS['mafia']} "
-                         f"Ваши сообщения, отправленные сюда, будут видны только союзникам."
+                    text=keyboard_message,
+                    reply_markup=inline_keyboard
                 )
-
-            elif player.role == 'doctor':
-                keyboard_message = f"Напомню, что наступила ночь. {ROLE_EMOJIS['doctor']} Выберите, кого вы вылечите этой ночью:"
-                possible_targets = players_alive
-                for target in possible_targets:
-                    target_buttons.append(
-                        InlineKeyboardButton(text=target.full_name, callback_data=f"doctor_heal_{game.id}_{target.id}"))
-            elif player.role == 'commissioner':
-                keyboard_message = f"Напомню, что наступила ночь. {ROLE_EMOJIS['commissioner']} Выберите, кого вы проверите этой ночью:"
-                possible_targets = [p for p in players_alive if p.id != player.id]
-                for target in possible_targets:
-                    target_buttons.append(InlineKeyboardButton(text=target.full_name, callback_data=f"com_check_{game.id}_{target.id}"))
-            elif player.role == 'maniac':
-                keyboard_message = f"Напомню, что наступила ночь. {ROLE_EMOJIS['maniac']} Выберите, кого вы убьете этой ночью:"
-                possible_targets = [p for p in players_alive if p.id != player.id]
-                for target in possible_targets:
-                    target_buttons.append(
-                        InlineKeyboardButton(text=target.full_name,
-                                             callback_data=f"maniac_kill_{game.id}_{target.id}"))
-
-            if target_buttons:
-                inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    target_buttons[i:i + 2] for i in range(0, len(target_buttons), 2)
-                ])
-                try:
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=keyboard_message,
-                        reply_markup=inline_keyboard
-                    )
-                    logging.info(f"Reminded player {player.full_name} ({player.role}) about night actions for game {game.id}.")
-                except TelegramForbiddenError:
-                    logging.warning(f"Бот заблокирован игроком {player.full_name} ({player.user_id}): не удалось отправить напоминание о ночных кнопках.")
-                except Exception as e:
-                    logging.error(f"Ошибка при повторной отправке ночных кнопок игроку {user_id}: {e}", exc_info=True)
-        except Exception as e:
-            logging.error(f"Ошибка в _send_night_action_buttons_and_faction_chat_if_needed для user {user_id}: {e}", exc_info=True)
-
+                logging.info(f"Reminded player {player.full_name} ({player.role}) about night actions for game {game.id}.")
+            except TelegramForbiddenError:
+                logging.warning(f"Бот заблокирован игроком {player.full_name} ({player.user_id}): не удалось отправить напоминание о ночных кнопках.")
+            except Exception as e:
+                logging.error(f"Ошибка при повторной отправке ночных кнопок игроку {user_id}: {e}", exc_info=True)
+    except Exception as e:
+        logging.error(f"Ошибка в _send_night_action_buttons_and_faction_chat_if_needed для user {user_id}: {e}", exc_info=True)
  
 async def cmd_help(message: Message):
     """
@@ -1664,19 +1690,19 @@ async def cmd_join(message: Message):
         await message.reply(f"Эту команду можно использовать только в групповом чате. {FACTION_EMOJIS['town']}")
         return
 
-    with Session() as session:
+     
         try:
             # Всегда гарантируем, что у игрока есть глобальный профиль
-            global_player = ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name)
+            global_player = await ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: добавлен await и BOT_ID
             # Если global_player None, значит произошла ошибка или это сам бот. ensure_player_profile_exists уже логирует это.
             if global_player is None:
                 await message.reply(f"Произошла ошибка при загрузке вашего профиля. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-                session.rollback()
+                await session.rollback()
                 return
-            session.commit() # Сохраняем создание/обновление глобального профиля
+            await session.commit() # Сохраняем создание/обновление глобального профиля
 
-            game = session.query(Game).filter_by(chat_id=message.chat.id, status='waiting').first()
-
+            result_game = await session.execute(select(Game).filter_by(chat_id=message.chat.id, status='waiting'))
+            game = result_game.scalars().first()
             if not game:
                 await message.reply(f"В этом чате нет ожидающей игры. Используйте /new_game, чтобы начать. {FACTION_EMOJIS['town']}")
                 return
@@ -1687,23 +1713,23 @@ async def cmd_join(message: Message):
         except Exception as e:
             logging.error(f"Ошибка при присоединении к игре через команду: {e}", exc_info=True)
             await message.reply(f"Произошла ошибка при присоединении к игре. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-            session.rollback()
+            await session.rollback()
 
 
  
 async def callback_join_game(query: CallbackQuery):
-    with Session() as session:
+     
         try:
             # Всегда гарантируем, что у игрока есть глобальный профиль
-            global_player = ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name)
+            global_player = await ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: добавлен await и BOT_ID
             if global_player is None:
                 await bot.send_message(query.message.chat.id,
                                        f"Произошла ошибка при загрузке профиля игрока <a href='tg://user?id={query.from_user.id}'>{query.from_user.full_name}</a>. Попробуйте позже. {FACTION_EMOJIS['missed']}",
                                        parse_mode=ParseMode.HTML)
                 await query.answer("Произошла ошибка. Попробуйте позже.", show_alert=True)
-                session.rollback()
+                await session.rollback()
                 return
-            session.commit() # Сохраняем создание/обновление глобального профиля
+            await session.commit()   # Сохраняем создание/обновление глобального профиля
 
             game_id = int(query.data.split('_')[2])
             await _handle_join_game(query.from_user.id, query.from_user.username, query.from_user.full_name, game_id,
@@ -1716,20 +1742,20 @@ async def callback_join_game(query: CallbackQuery):
                                    f"Произошла ошибка при присоединении игрока <a href='tg://user?id={query.from_user.id}'>{query.from_user.full_name}</a> к игре. {FACTION_EMOJIS['missed']}",
                                    parse_mode=ParseMode.HTML)
             await query.answer("Произошла ошибка. Попробуйте позже.", show_alert=True)
-            session.rollback()
+            await session.rollback()
 
-
- 
 async def handle_gif(message: Message):
     if message.chat.type == ChatType.PRIVATE:
         await message.answer(f"File ID вашего GIF: <code>{message.animation.file_id}</code>")
 
 async def _handle_join_game(user_id: int, username: str, full_name: str, game_id: int, chat_id: int,
                              is_callback: bool = False):
-    with Session() as session:
+ 
         try:
             # Здесь global_player уже должен быть гарантирован через cmd_join или callback_join_game
-            global_player_profile = session.query(Player).filter_by(user_id=user_id, game_id=None).first()
+             
+            result_global_player_profile = await session.execute(select(Player).filter_by(user_id=user_id, game_id=None))
+            global_player_profile = result_global_player_profile.scalars().first()
             if not global_player_profile:
                 # Если функция вызвана напрямую, а глобального профиля нет.
                 # ensure_player_profile_exists уже логирует ошибку и возвращает None.
@@ -1743,7 +1769,7 @@ async def _handle_join_game(user_id: int, username: str, full_name: str, game_id
                 return
 
 
-            game = session.get(Game, game_id)
+            game = await session.get(Game, game_id) 
             if not game or game.status != 'waiting':
                 
                 alert_text = f"Эта игра уже началась или была отменена. {FACTION_EMOJIS['missed']}"
@@ -1753,7 +1779,8 @@ async def _handle_join_game(user_id: int, username: str, full_name: str, game_id
                     await bot.send_message(chat_id=chat_id, text=alert_text)
                 return
             # --- Создание или получение Группы (Города) для чата ---
-            group = session.query(Group).filter_by(chat_id=chat_id).first()
+            result_group = await session.execute(select(Group).filter_by(chat_id=chat_id))
+            group = result_group.scalars().first()
             if not group:
                 chat_info = await bot.get_chat(chat_id)
                 group_name = chat_info.title if chat_info.title else f"Группа {chat_id}"
@@ -1772,7 +1799,8 @@ async def _handle_join_game(user_id: int, username: str, full_name: str, game_id
             session.add(global_player_profile)
 
 
-            existing_player_game_instance = session.query(Player).filter_by(user_id=user_id, game_id=game.id).first()
+            result_existing_player_game_instance = await session.execute(select(Player).filter_by(user_id=user_id, game_id=game.id))
+            existing_player_game_instance = result_existing_player_game_instance.scalars().first()
             if existing_player_game_instance:
                 alert_text = f"Вы уже в этой игре! {FACTION_EMOJIS['missed']}"
                 if is_callback:
@@ -1788,10 +1816,11 @@ async def _handle_join_game(user_id: int, username: str, full_name: str, game_id
             player_game_instance = Player(user_id=user_id, username=username, full_name=full_name, game_id=game.id,
                                           gender=player_gender, last_played_group_id=group.id)
             session.add(player_game_instance)
-            session.commit() # Коммитим все изменения, включая глобальный профиль и новый игровой экземпляр
+            await session.commit() # Коммитим все изменения, включая глобальный профиль и новый игровой экземпляр
             logging.info(f"Player {full_name} ({user_id}) joined game {game.id}.")
 
-            players_in_game = session.query(Player).filter_by(game_id=game.id).all()
+            result_players_in_game = await session.execute(select(Player).filter_by(game_id=game.id))
+            players_in_game = result_players_in_game.scalars().all()
             num_players = len(players_in_game)
             player_names_list = [f"<a href='tg://user?id={p.user_id}'>{p.full_name}</a>" for p in players_in_game]
             player_list_str = "\n".join(player_names_list)
@@ -1804,7 +1833,8 @@ async def _handle_join_game(user_id: int, username: str, full_name: str, game_id
 
             if game.start_message_id:
                 try:
-                    organizer = session.query(Player).filter_by(game_id=game.id).order_by(Player.id).first()
+                    result_organizer = await session.execute(select(Player).filter_by(game_id=game.id).order_by(Player.id))
+                    organizer = result_organizer.scalars().first()
                     organizer_link = f"<a href='tg://user?id={organizer.user_id}'>{organizer.full_name}</a>" if organizer else "Неизвестный организатор"
                     await bot.edit_message_text(
                         chat_id=game.chat_id,
@@ -1846,7 +1876,7 @@ async def _handle_join_game(user_id: int, username: str, full_name: str, game_id
         except Exception as e:
             logging.error(f"Критическая ошибка в _handle_join_game для user {user_id}, game {game_id}: {e}", exc_info=True)
             await bot.send_message(chat_id=chat_id, text=f"Произошла ошибка при присоединении. {FACTION_EMOJIS['missed']}")
-            session.rollback()
+            await session.rollback()
 
 
  
@@ -1859,31 +1889,35 @@ async def cmd_leave(message: Message):
         await message.reply(f"Эту команду можно использовать только в групповом чате. {PHASE_EMOJIS['death']}")
         return
 
-    with Session() as session:
+    
         try:
-            game = session.query(Game).filter_by(chat_id=message.chat.id, status='waiting').first()
-
+            result_game = await session.execute(select(Game).filter_by(chat_id=message.chat.id, status='waiting'))
+            game = result_game.scalars().first()
             if not game:
                 await message.reply(f"В этом чате нет ожидающей игры, из которой можно выйти. {PHASE_EMOJIS['death']}")
                 return
 
-            player = session.query(Player).filter_by(
-                user_id=message.from_user.id,
-                game_id=game.id
-            ).first()
+            result_player = await session.execute(
+                select(Player).filter_by(
+                    user_id=message.from_user.id,
+                    game_id=game.id
+                )
+            )
+            player = result_player.scalars().first()
 
             if not player:
                 await message.reply(f"Вы не являетесь участником этой игры. {PHASE_EMOJIS['death']}")
             else:
-                first_player_in_game = session.query(Player).filter_by(game_id=game.id).order_by(Player.id).first()
+                result_first_player_in_game = await session.execute(select(Player).filter_by(game_id=game.id).order_by(Player.id))
+                first_player_in_game = result_first_player_in_game.scalars().first()
                 is_organizer = first_player_in_game and first_player_in_game.user_id == message.from_user.id
 
                 session.delete(player)
-                session.commit()
+                await session.commit() 
                 logging.info(f"Player {message.from_user.full_name} ({message.from_user.id}) left game {game.id}.")
 
-                num_players = session.query(Player).filter_by(game_id=game.id).count()
-                
+                num_players_result = await session.execute(select(func.count(Player.id)).filter_by(game_id=game.id))
+                num_players = num_players_result.scalar_one()
                 await bot.send_message(
                     chat_id=message.chat.id,
                     text=f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.full_name}</a> покинул игру. {PHASE_EMOJIS['death']}\n"
@@ -1893,7 +1927,7 @@ async def cmd_leave(message: Message):
                 
                 if num_players == 0:
                     session.delete(game)
-                    session.commit()
+                    await session.commit() 
                     await bot.send_message(chat_id=message.chat.id,
                                            text=f"Все игроки покинули игру. Игра отменена. {PHASE_EMOJIS['death']}")
                     try:
@@ -1905,7 +1939,8 @@ async def cmd_leave(message: Message):
                     except Exception as e:
                         logging.error(f"Неизвестная ошибка при удалении стартового сообщения: {e}")
                 elif is_organizer:
-                    next_organizer = session.query(Player).filter_by(game_id=game.id).order_by(Player.id).first()
+                    result_next_organizer = await session.execute(select(Player).filter_by(game_id=game.id).order_by(Player.id))
+                    next_organizer = result_next_organizer.scalars().first()
                     if next_organizer:
                         await bot.send_message(chat_id=message.chat.id,
                                                text=f"Организатор покинул игру. Новым организатором становится <a href='tg://user?id={next_organizer.user_id}'>{next_organizer.full_name}</a>. {FACTION_EMOJIS['town']}",
@@ -1915,7 +1950,7 @@ async def cmd_leave(message: Message):
         except Exception as e:
             logging.error(f"Ошибка при выходе из игры: {e}", exc_info=True)
             await message.reply(f"Произошла ошибка при выходе из игры. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-            session.rollback()
+            await session.rollback()
 
 
  
@@ -1938,14 +1973,16 @@ async def callback_start_game(query: CallbackQuery):
 
 
 async def _handle_start_game(user_id: int, chat_id: int, is_callback: bool = False):
-    with Session() as session:
+       
         try:
-            game = session.query(Game).filter_by(chat_id=chat_id, status='waiting').first()
+            result_game = await session.execute(select(Game).filter_by(chat_id=chat_id, status='waiting'))
+            game = result_game.scalars().first()
             if not game:
                 await bot.send_message(chat_id=chat_id, text=f"В этом чате нет ожидающей игры. Используйте /new_game, чтобы начать. {PHASE_EMOJIS['day']}")
                 return
 
-            players = session.query(Player).filter_by(game_id=game.id).all()
+            result_players = await session.execute(select(Player).filter_by(game_id=game.id))
+            players = result_players.scalars().all()
             num_players = len(players)
 
             if num_players < MIN_PLAYERS_TO_START:
@@ -1957,7 +1994,8 @@ async def _handle_start_game(user_id: int, chat_id: int, is_callback: bool = Fal
                 )
                 return
 
-            first_player = session.query(Player).filter_by(game_id=game.id).order_by(Player.id).first()
+            result_first_player = await session.execute(select(Player).filter_by(game_id=game.id).order_by(Player.id))
+            first_player = result_first_player.scalars().first()
             is_chat_admin = False
             try:
                 chat_member = await bot.get_chat_member(chat_id, user_id)
@@ -1993,7 +2031,7 @@ async def _handle_start_game(user_id: int, chat_id: int, is_callback: bool = Fal
                 # Здесь только устанавливаем role и is_alive для ИГРОВОЙ записи.
                 session.add(player)
             
-            session.commit()
+            await session.commit()
             logging.info(f"Roles assigned and all players committed as alive for game {game.id}.")
 
             # ЭТАП 2: Отправляем информацию о ролях и СОЮЗНИКАХ
@@ -2012,11 +2050,14 @@ async def _handle_start_game(user_id: int, chat_id: int, is_callback: bool = Fal
                     )
                     
                     if player.role in ['mafia', 'don']:
-                        mafia_faction_members = session.query(Player).filter(
-                            Player.game_id == game.id,
-                            Player.is_alive == True,
-                            Player.role.in_(['mafia', 'don'])
-                        ).all()
+                        result_mafia_faction_members = await session.execute(
+                            select(Player).filter(
+                                Player.game_id == game.id,
+                                Player.is_alive == True,
+                                Player.role.in_(['mafia', 'don'])
+                            )
+                        )
+                        mafia_faction_members = result_mafia_faction_members.scalars().all()
 
                         if mafia_faction_members:
                             faction_list_text = "<b>Твоя фракция Мафии:</b>\n" 
@@ -2040,10 +2081,10 @@ async def _handle_start_game(user_id: int, chat_id: int, is_callback: bool = Fal
                              f"Это критично для игры! {PHASE_EMOJIS['day']} Игра отменена.",
                         parse_mode=ParseMode.HTML
                     )
-                    session.rollback()
+                    await session.rollback()
                     game.status = 'cancelled'
                     session.add(game)
-                    session.commit()
+                    await session.commit()
                     return
                 except Exception as e:
                     logging.error(f"Не удалось отправить роль/союзников игроку {player.full_name} ({player.user_id}): {e}",
@@ -2055,10 +2096,10 @@ async def _handle_start_game(user_id: int, chat_id: int, is_callback: bool = Fal
                              f"Это критично для игры! {PHASE_EMOJIS['day']} Игра отменена.",
                         parse_mode=ParseMode.HTML
                     )
-                    session.rollback()
+                    await session.rollback()
                     game.status = 'cancelled'
                     session.add(game)
-                    session.commit()
+                    await session.commit()
                     return
 
             # ЭТАП 3: Устанавливаем статус игры на 'playing' и коммитим
@@ -2073,7 +2114,7 @@ async def _handle_start_game(user_id: int, chat_id: int, is_callback: bool = Fal
             game.lynch_message_id = None
             game.lynch_voters = ""
             session.add(game)
-            session.commit()
+            await session.commit()
             logging.info(f"Game {game.id} started. Transitioned to 'night' phase.")
 
             try:
@@ -2081,7 +2122,7 @@ async def _handle_start_game(user_id: int, chat_id: int, is_callback: bool = Fal
                     await bot.delete_message(chat_id=chat_id, message_id=game.start_message_id)
                     game.start_message_id = None
                     session.add(game)
-                    session.commit()
+                    await session.commit()
                     logging.info(f"Deleted game {game.id} start message.")
             except (TelegramBadRequest, TelegramForbiddenError) as e:
                 logging.warning(f"Не удалось удалить стартовое сообщение игры {game.id}: {e}")
@@ -2105,7 +2146,7 @@ async def _handle_start_game(user_id: int, chat_id: int, is_callback: bool = Fal
         except Exception as e:
             logging.error(f"Ошибка при старте игры: {e}", exc_info=True)
             await bot.send_message(chat_id=chat_id, text=f"Произошла ошибка при начале игры. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-            session.rollback()
+            await session.rollback()
 
 
  
@@ -2118,20 +2159,23 @@ async def cmd_cancel_game(message: Message):
         await message.reply(f"Эту команду можно использовать только в групповом чате. {PHASE_EMOJIS['death']}")
         return
 
-    with Session() as session:
+     
         try:
-            game = session.query(Game).filter(
-                Game.chat_id == message.chat.id,
-                Game.status.in_(['waiting', 'playing'])
-            ).first()
+            result_game = await session.execute(
+                select(Game).filter(
+                    Game.chat_id == message.chat.id,
+                    Game.status.in_(['waiting', 'playing'])
+                )
+            )
+            game = result_game.scalars().first()
 
             if not game:
                 await message.reply(f"В этом чате нет активной игры для отмены. {PHASE_EMOJIS['death']}")
                 return
 
             can_cancel = False
-            first_player = session.query(Player).filter_by(game_id=game.id).order_by(Player.id).first()
-            
+            result_first_player = await session.execute(select(Player).filter_by(game_id=game.id).order_by(Player.id))
+            first_player = result_first_player.scalars().first()
             is_chat_admin = False
             try:
                 chat_member = await bot.get_chat_member(message.chat.id, message.from_user.id)
@@ -2146,7 +2190,8 @@ async def cmd_cancel_game(message: Message):
                 elif is_chat_admin:
                     can_cancel = True
             elif game.status == 'playing':
-                player_in_game = session.query(Player).filter_by(user_id=message.from_user.id, game_id=game.id).first()
+                result_player_in_game = await session.execute(select(Player).filter_by(user_id=message.from_user.id, game_id=game.id))
+                player_in_game = result_player_in_game.scalars().first()
                 if player_in_game:
                     can_cancel = True
                 elif is_chat_admin:
@@ -2166,10 +2211,11 @@ async def cmd_cancel_game(message: Message):
 
             game.status = 'cancelled'
             session.add(game)
-            session.commit()
+            await session.commit()
             logging.info(f"Game {game.id} cancelled by player {message.from_user.full_name}.")
 
-            players_in_cancelled_game = session.query(Player).filter_by(game_id=game.id).all()
+            result_players_in_cancelled_game = await session.execute(select(Player).filter_by(game_id=game.id))
+            players_in_cancelled_game = result_players_in_cancelled_game.scalars().all()
             for player in players_in_cancelled_game:
                 try:
                     await bot.send_message(player.user_id,
@@ -2186,7 +2232,7 @@ async def cmd_cancel_game(message: Message):
                     await bot.delete_message(chat_id=game.chat_id, message_id=game.start_message_id)
                     game.start_message_id = None
                     session.add(game)
-                    session.commit()
+                    await session.commit()
                     logging.info(f"Deleted game {game.id} start message after cancellation.")
             except (TelegramBadRequest, TelegramForbiddenError) as e:
                 logging.warning(f"Не удалось удалить стартовое сообщение игры {game.id}: {e}")
@@ -2197,7 +2243,7 @@ async def cmd_cancel_game(message: Message):
         except Exception as e:
             logging.error(f"Ошибка при отмене игры: {e}", exc_info=True)
             await message.reply(f"Произошла ошибка при отмене игры. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-            session.rollback()
+            await session.rollback()
 
 
  
@@ -2209,17 +2255,18 @@ async def cmd_players(message: Message):
         await message.reply(f"Эту команду можно использовать только в групповом чате. {FACTION_EMOJIS['town']}")
         return
 
-    with Session() as session:
+     
         try:
-            game = session.query(Game).filter_by(chat_id=message.chat.id, status='playing').first()
-
+            result_game = await session.execute(select(Game).filter_by(chat_id=message.chat.id, status='playing'))
+            game = result_game.scalars().first()
             if not game:
                 await message.reply(f"В этом чате нет активной игры. {PHASE_EMOJIS['death']}")
                 return
 
-            players_alive = session.query(Player).filter_by(game_id=game.id, is_alive=True).all()
-            players_dead = session.query(Player).filter_by(game_id=game.id, is_alive=False).all()
-
+            result_players_alive = await session.execute(select(Player).filter_by(game_id=game.id, is_alive=True))
+            players_alive = result_players_alive.scalars().all()
+            result_players_dead = await session.execute(select(Player).filter_by(game_id=game.id, is_alive=False))
+            players_dead = result_players_dead.scalars().all()
             if not players_alive and not players_dead:
                 await message.reply(f"В этой игре пока нет игроков. {FACTION_EMOJIS['missed']}")
                 return
@@ -2251,24 +2298,24 @@ async def cmd_profile(message: Message):
         await message.reply(f"Для просмотра профиля используйте эту команду в личной переписке с ботом. {FACTION_EMOJIS['town']}")
         return
 
-    with Session() as session:
+     
         try:
-            player_data = ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name)
+            player_data = await ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: добавлен await и BOT_ID
             if player_data is None:
                 logging.error(f"Failed to get/create player profile for user {message.from_user.id}. Possibly bot's own ID.")
                 await message.reply(f"Произошла ошибка при загрузке вашего профиля. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-                session.rollback()
+                await session.rollback()
                 return 
-            session.commit() # Сохраняем создание/обновление глобального профиля
+            await session.commit() # Сохраняем создание/обновление глобального профиля
 
-            await display_player_profile(message, player_data) 
+            await display_player_profile(message, player_data, session) 
             logging.info(f"Player {message.from_user.full_name} requested their profile.")
 
         except Exception as e:
             logging.error(f"Ошибка при получении профиля игрока {message.from_user.id}: {e}", exc_info=True)
             await message.reply(f"Произошла ошибка при загрузке профиля. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-            session.rollback()
-async def display_player_profile(message: Message, player_data: Player):
+            await session.rollback()
+async def display_player_profile(message: Message, player_data: Player, session: AsyncSession):
     """
     Формирует и отправляет сообщение с профилем игрока, используя новые разделители и полную статистику.
     player_data здесь - это ГЛОБАЛЬНЫЙ ПРОФИЛЬ (game_id=None).
@@ -2311,11 +2358,11 @@ async def display_player_profile(message: Message, player_data: Player):
     divider_bottom = frame["bottom"]
 
     group_info_text = ""
-    with Session() as session:
-        if player_data.last_played_group_id:
-            group_obj = session.query(Group).filter_by(id=player_data.last_played_group_id).first()
-            if group_obj:
-                group_info_text = f"<b>{format_group_info(group_obj)}</b>"
+     
+    if player_data.last_played_group_id:
+        group_obj = await session.get(Group, player_data.last_played_group_id)
+        if group_obj:
+            group_info_text = f"<b>{format_group_info(group_obj)}</b>"
     
     # Титул игрока
     player_title_text = ""
@@ -2324,35 +2371,35 @@ async def display_player_profile(message: Message, player_data: Player):
     player_title_text = f"{title_info['emoji']} [{title_info['name_ru']}] "
 
 
-    dollars_display = "?" if is_owner else str(player_data.dollars)
-    diamonds_display = "?" if is_owner else f"{player_data.diamonds:.2f}"
+    dollars_display = "∞" if is_owner else str(player_data.dollars)
+    diamonds_display = "∞" if is_owner else f"{player_data.diamonds:.2f}"
     profile_text = (
         f"<code>{divider_top}</code>\n"
-        f"?? Профиль игрока: {player_title_text}<b>{player_data.full_name}</b>\n"
+        f"👤 Профиль игрока: {player_title_text}<b>{player_data.full_name}</b>\n"
         f"<code>{divider_middle}</code>\n"
-        f"?? ID: <code>{player_data.user_id}</code>\n"
-        f"? Ник: @{player_data.username if player_data.username else 'нет'}\n"
-        f"?? Пол: {gender_emoji} {gender_name}\n"
+        f"🆔 ID: <code>{player_data.user_id}</code>\n"
+        f"💬 Ник: @{player_data.username if player_data.username else 'нет'}\n"
+        f"🚻 Пол: {gender_emoji} {gender_name}\n"
         f"<code>{divider_middle}</code>\n"
         f"{group_info_text}" # Информация о группе
         f"{FACTION_EMOJIS['dollars']} Долларов: {dollars_display}\n" 
         f"{FACTION_EMOJIS['diamonds']} Бриллиантов: {diamonds_display}\n" 
         f"<code>{divider_middle}</code>\n"
-        f"?? Уровень: {player_data.level}\n"
-        f"? Опыт: {player_data.experience:.0f} (до след. ур: {max(0, remaining_exp):.0f})\n"
+        f"⬆ Уровень: {player_data.level}\n"
+        f"✨ Опыт: {player_data.experience:.0f} (до след. ур: {max(0, remaining_exp):.0f})\n"
         f"<code>{divider_middle}</code>\n"
-        f"?? Количество побед: {player_data.total_wins}\n"
-        f"?? Общее количество игр: {player_data.total_games}\n"
-        f"?? Win Rate (WR): {win_rate:.2f}%\n"
-        f"?? Kill/Death (KD): {kd_ratio_text}\n"
+        f"🏆 Количество побед: {player_data.total_wins}\n"
+        f"🎮 Общее количество игр: {player_data.total_games}\n"
+        f"📈 Win Rate (WR): {win_rate:.2f}%\n"
+        f"⚔️ Kill/Death (KD): {kd_ratio_text}\n"
         f"<code>{divider_bottom}</code>"
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Пол {GENDER_EMOJIS['unspecified']}", callback_data="set_gender_prompt")],
-        [InlineKeyboardButton(text=f"?? Пожертвовать", callback_data="donate_prompt")],
-        [InlineKeyboardButton(text=f"??? Рамки", callback_data="select_frame_prompt")], # НОВАЯ КНОПКА
-        [InlineKeyboardButton(text=f"??? Титулы", callback_data="select_title_prompt")] # НОВАЯ КНОПКА
+        [InlineKeyboardButton(text=f"💸 Пожертвовать", callback_data="donate_prompt")],
+        [InlineKeyboardButton(text=f"🖼 Рамки", callback_data="select_frame_prompt")], # НОВАЯ КНОПКА
+        [InlineKeyboardButton(text=f"🏷 Титулы", callback_data="select_title_prompt")] # НОВАЯ КНОПКА
     ])
 
     await message.reply(profile_text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
@@ -2360,35 +2407,35 @@ async def display_player_profile(message: Message, player_data: Player):
 # --- НОВЫЙ ХЭНДЛЕР ДЛЯ ВЫБОРА ГРУППЫ ДЛЯ ПОЖЕРТВОВАНИЯ ---
   
 async def callback_select_donate_group(query: CallbackQuery, state: FSMContext):
-    with Session() as session:
-        try:
-            group_id = int(query.data.split('_')[3])
-            selected_group = session.get(Group, group_id)
-            fsm_data = await state.get_data()
-            user_id_from_fsm = fsm_data.get('user_id') 
+    # Удалить 'with Session() as session:'
+    try:
+        group_id = int(query.data.split('_')[3])
+        selected_group = await session.get(Group, group_id)
+        fsm_data = await state.get_data()
+        user_id_from_fsm = fsm_data.get('user_id') 
+        
+        logging.debug(f"DEBUG: In callback_select_donate_group. user_id_from_fsm: {user_id_from_fsm}, query.from_user.id: {query.from_user.id}")
+
+        player_result = await session.execute(select(Player).filter_by(user_id=user_id_from_fsm, game_id=None))
+        player = player_result.scalars().first()
             
-            logging.debug(f"DEBUG: In callback_select_donate_group. user_id_from_fsm: {user_id_from_fsm}, query.from_user.id: {query.from_user.id}")
+        if player:
+            logging.debug(f"DEBUG: Player (global profile) found. ID: {player.id}, User_ID: {player.user_id}, Full Name: {player.full_name}, Game_ID: {player.game_id}")
+        else:
+            logging.debug(f"DEBUG: Player (global profile) NOT FOUND for user_id {user_id_from_fsm}.")
+            await query.answer("Ошибка: Профиль игрока не найден. Попробуйте снова через /donate.", show_alert=True)
+            await state.clear()
+            return # rollback будет сделан middleware
 
-            player = session.query(Player).filter_by(user_id=user_id_from_fsm, game_id=None).first() 
-                
-            if player:
-                logging.debug(f"DEBUG: Player (global profile) found. ID: {player.id}, User_ID: {player.user_id}, Full Name: {player.full_name}, Game_ID: {player.game_id}")
-            else:
-                logging.debug(f"DEBUG: Player (global profile) NOT FOUND for user_id {user_id_from_fsm}.")
-                # Если player не найден, отправляем alert и выходим
-                await query.answer("Ошибка: Профиль игрока не найден. Попробуйте снова через /donate.", show_alert=True)
-                await state.clear()
-                return
-
-            if not selected_group or selected_group.id != group_id: # Добавил проверку, что найденная группа соответствует ID
-                logging.warning(f"WARNING: Selected group not found or ID mismatch. selected_group: {bool(selected_group)}, group_id: {group_id}")
-                await query.answer("Ошибка выбора группы. Группа не найдена. Попробуйте снова через /donate.", show_alert=True)
-                await state.clear()
-                return
+        if not selected_group or selected_group.id != group_id:
+            logging.warning(f"WARNING: Selected group not found or ID mismatch. selected_group: {bool(selected_group)}, group_id: {group_id}")
+            await query.answer("Ошибка выбора группы. Группа не найдена. Попробуйте снова через /donate.", show_alert=True)
+            await state.clear()
+            return # rollback будет сделан middleware
             
             # Формируем информацию о текущих средствах
-            player_dollars_display = "??" if player.user_id == BOT_OWNER_ID else str(player.dollars)
-            player_diamonds_display = "??" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
+            player_dollars_display = "?" if player.user_id == BOT_OWNER_ID else str(player.dollars)
+            player_diamonds_display = "?" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
 
             group_details = format_group_info(selected_group)
             logging.debug(f"DEBUG: Formatted group info: {group_details}") # Логируем результат format_group_info
@@ -2421,35 +2468,30 @@ async def callback_select_donate_group(query: CallbackQuery, state: FSMContext):
                 await query.answer("Произошла ошибка при обновлении сообщения.", show_alert=True)
                 await state.clear()
 
-        except Exception as e: 
-                logging.error(f"Критическая ошибка в callback_select_donate_group для {query.from_user.id}: {e}", exc_info=True)
-                await query.answer("Произошла критическая ошибка при выборе группы.", show_alert=True)
-                await state.clear()
-                session.rollback()
-
-  
+    except Exception as e: 
+        logging.error(f"Критическая ошибка в callback_select_donate_group для {query.from_user.id}: {e}", exc_info=True)
+        await query.answer("Произошла критическая ошибка при выборе группы.", show_alert=True)
+        await state.clear()
+        # await session.rollback() # <--- УДАЛИТЕ ЭТУ СТРОКУ, rollback будет сделан middleware 
 async def callback_donate_currency_selection(query: CallbackQuery, state: FSMContext):
-    with Session() as session:
+       
         try:
             parts = query.data.split('_')
-            currency_type = parts[2] # 'dollars' или 'diamonds'
+            currency_type = parts[2]
             group_id = int(parts[3])
             fsm_data = await state.get_data()
             user_id_from_fsm = fsm_data.get('user_id')
             
-            # --- НОВЫЕ ЛОГИ ---
             logging.debug(f"DEBUG_CURRENCY_SEL: query.from_user.id: {query.from_user.id}")
             logging.debug(f"DEBUG_CURRENCY_SEL: user_id_from_fsm (from state): {user_id_from_fsm}")
             logging.debug(f"DEBUG_CURRENCY_SEL: selected_group_id (from state, should be {group_id}): {fsm_data.get('selected_group_id')}")
-            # --- КОНЕЦ НОВЫХ ЛОГОВ ---
 
-            player = session.query(Player).filter_by(user_id=user_id_from_fsm, game_id=None).first()
-            selected_group = session.get(Group, group_id)
+            result_player = await session.execute(select(Player).filter_by(user_id=user_id_from_fsm, game_id=None))
+            player = result_player.scalars().first()
+            selected_group = await session.get(Group, group_id) # async get
 
-            # Перепроверяем на соответствие ID, это наш "ключ"
             if player and player.user_id != user_id_from_fsm:
                  logging.error(f"CRITICAL_ERROR: Player object user_id ({player.user_id}) does not match user_id_from_fsm ({user_id_from_fsm}) after query. This should not happen!")
-                 # Здесь можно даже сбросить FSM или запросить перелогин, т.к. это очень странная ошибка
 
             if not player or player.user_id != query.from_user.id or not selected_group:
                 logging.warning(f"WARNING: Player or group not found/mismatch in callback_donate_currency_selection. "
@@ -2462,12 +2504,11 @@ async def callback_donate_currency_selection(query: CallbackQuery, state: FSMCon
 
             await state.update_data(selected_currency_type=currency_type)
 
-            player_dollars_display = "??" if player.user_id == BOT_OWNER_ID else str(player.dollars)
-            player_diamonds_display = "??" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
+            player_dollars_display = "?" if player.user_id == BOT_OWNER_ID else str(player.dollars)
+            player_diamonds_display = "?" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
 
             group_details_for_display = format_group_info(selected_group)
             logging.debug(f"DEBUG_CURRENCY_SEL: Formatted group info for currency selection: {group_details_for_display}")
-
 
             message_text = ""
             if currency_type == 'dollars':
@@ -2513,8 +2554,7 @@ async def callback_donate_currency_selection(query: CallbackQuery, state: FSMCon
             logging.error(f"Критическая ошибка в callback_donate_currency_selection для {query.from_user.id}: {e}", exc_info=True)
             await query.answer("Произошла критическая ошибка при выборе валюты.", show_alert=True)
             await state.clear()
-            session.rollback()
- 
+            # await session.rollback() # <--- УДАЛИТЕ ЭТУ СТРОКУ, rollback будет сделан middleware
 async def callback_set_gender_prompt(query: CallbackQuery):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Мужской {GENDER_EMOJIS['male']}", callback_data="set_gender_male")],
@@ -2526,10 +2566,11 @@ async def callback_set_gender_prompt(query: CallbackQuery):
 
  
 async def callback_set_gender(query: CallbackQuery):
-    with Session() as session:
+     
         try:
             # Ищем глобальный профиль
-            player = session.query(Player).filter_by(user_id=query.from_user.id, game_id=None).first()
+            result_player = await session.execute(select(Player).filter_by(user_id=query.from_user.id, game_id=None))
+            player = result_player.scalars().first()
             if not player:
                 await query.answer("Ваш профиль не найден.", show_alert=True)
                 # Это должно быть невозможно, если ensure_player_profile_exists работает
@@ -2538,7 +2579,7 @@ async def callback_set_gender(query: CallbackQuery):
             gender_chosen = query.data.split('_')[2]
             player.gender = gender_chosen
             session.add(player)
-            session.commit()
+            await session.commit()
             logging.info(f"Player {query.from_user.full_name} ({query.from_user.id}) set gender to {gender_chosen}.")
 
             gender_emoji = GENDER_EMOJIS.get(gender_chosen, "?")
@@ -2550,7 +2591,7 @@ async def callback_set_gender(query: CallbackQuery):
         except Exception as e:
             logging.error(f"Ошибка при установке пола для игрока {query.from_user.id}: {e}", exc_info=True)
             await query.answer("Произошла ошибка при установке пола.", show_alert=True)
-            session.rollback()
+            await session.rollback()
 
 
 # Удалите декоратор @dp.message(Command("donate")) из cmd_donate
@@ -2561,44 +2602,45 @@ async def _process_donate_command_logic(user_id: int, username: str, full_name: 
     Обрабатывает основную логику для команды /donate.
     reply_sender_func - это асинхронная функция, которая принимает текст и отправляет ответ.
     """
-    with Session() as session:
-        player = ensure_player_profile_exists(session, user_id, username, full_name)
-        if player is None:
-            logging.error(f"Не удалось получить/создать профиль игрока для пользователя {user_id}. Возможно, это ID самого бота.")
-            await reply_sender_func(f"Произошла ошибка при загрузке вашего профиля. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-            session.rollback()
-            return
-        session.commit()
+     
+    player = await ensure_player_profile_exists(session, user_id, username, full_name, BOT_ID)
+    if player is None:
+        logging.error(f"Не удалось получить/создать профиль игрока для пользователя {user_id}. Возможно, это ID самого бота.")
+        await reply_sender_func(f"Произошла ошибка при загрузке вашего профиля. Попробуйте позже. {FACTION_EMOJIS['missed']}")
+        await session.rollback()
+        return
+    await session.commit()
 
         # Получаем все группы из базы данных
-        all_groups = session.query(Group).all()
+    result_all_groups = await session.execute(select(Group)) # <--- ИСПРАВЛЕНИЕ: добавьте эту строку
+    all_groups = result_all_groups.scalars().all()
 
         # Формируем информацию о текущих средствах отправителя
-        player_dollars_display = "??" if player.user_id == BOT_OWNER_ID else str(player.dollars)
-        player_diamonds_display = "??" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
+    player_dollars_display = "??" if player.user_id == BOT_OWNER_ID else str(player.dollars)
+    player_diamonds_display = "??" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
 
-        if not all_groups:
-            await reply_sender_func(f"К сожалению, пока нет ни одной зарегистрированной группы, в которую можно пожертвовать. {FACTION_EMOJIS['missed']}\n"
-                                f"Чтобы добавить группу, пригласите меня в чат и создайте новую игру с помощью /new_game.", parse_mode=ParseMode.HTML)
-            await state.clear()
-            return
+    if not all_groups:
+        await reply_sender_func(f"К сожалению, пока нет ни одной зарегистрированной группы, в которую можно пожертвовать. {FACTION_EMOJIS['missed']}\n"
+                            f"Чтобы добавить группу, пригласите меня в чат и создайте новую игру с помощью /new_game.", parse_mode=ParseMode.HTML)
+        await state.clear()
+        return
 
         # Всегда показываем кнопки выбора групп, даже если группа одна
-        keyboard_buttons = []
-        for group_obj in all_groups:
-            keyboard_buttons.append(InlineKeyboardButton(text=f"{group_obj.name} (Ур. {group_obj.level})", callback_data=f"select_donate_group_{group_obj.id}"))
+    keyboard_buttons = []
+    for group_obj in all_groups:
+        keyboard_buttons.append(InlineKeyboardButton(text=f"{group_obj.name} (Ур. {group_obj.level})", callback_data=f"select_donate_group_{group_obj.id}"))
 
-        inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            keyboard_buttons[i:i + 1] for i in range(0, len(keyboard_buttons), 1)])
-        await reply_sender_func(
-            f"Выберите, в Фонд какого Города вы хотите пожертвовать:\n"
-            f"Ваши текущие средства: {player_dollars_display} Долларов, {player_diamonds_display} Бриллиантов.",
-            reply_markup=inline_keyboard,
-            parse_mode=ParseMode.HTML
-        )
-        await state.set_state(GameState.waiting_for_donate_group_selection)
-        await state.update_data(user_id=player.user_id)
-        logging.info(f"Игрок {player.full_name} ({player.user_id}) выбирает группу для пожертвования.")
+    inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        keyboard_buttons[i:i + 1] for i in range(0, len(keyboard_buttons), 1)])
+    await reply_sender_func(
+        f"Выберите, в Фонд какого Города вы хотите пожертвовать:\n"
+        f"Ваши текущие средства: {player_dollars_display} Долларов, {player_diamonds_display} Бриллиантов.",
+        reply_markup=inline_keyboard,
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(GameState.waiting_for_donate_group_selection)
+    await state.update_data(user_id=player.user_id)
+    logging.info(f"Игрок {player.full_name} ({player.user_id}) выбирает группу для пожертвования.")
 
 # Теперь ваш настоящий обработчик cmd_donate будет просто вызывать эту логику
  
@@ -2652,14 +2694,14 @@ async def callback_donate_prompt(query: CallbackQuery):
 # --- Хэндлеры для give_dollars и give_diamonds (обновленные) ---
  
 async def cmd_give_dollars(message: Message, state: FSMContext):
-    with Session() as session:
-        sender_player = ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name)
+     
+        sender_player = await ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: await и BOT_ID
         if sender_player is None: 
                 logging.error(f"Failed to get/create player profile for user {message.from_user.id}. Possibly bot's own ID.")
                 await message.reply(f"Произошла ошибка при загрузке вашего профиля. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-                session.rollback()
+                await session.rollback()
                 return 
-        session.commit()
+        await session.commit()
 
         amount_str = None
         target_user_id = None
@@ -2709,10 +2751,11 @@ async def cmd_give_dollars(message: Message, state: FSMContext):
 
             target_player = None
             if target_user_id:
-                target_player = session.query(Player).filter_by(user_id=target_user_id, game_id=None).first()
+                result_target_player = await session.execute(select(Player).filter_by(user_id=target_user_id, game_id=None))
+                target_player = result_target_player.scalars().first()
             elif target_username:
-                target_player = session.query(Player).filter_by(username=target_username, game_id=None).first()
-
+                result_target_player = await session.execute(select(Player).filter_by(username=target_username, game_id=None))
+                target_player = result_target_player.scalars().first()
             if not target_player:
                 await message.reply(f"Игрок {'@'+target_username if target_username else f'с ID {target_user_id}'} не найден в базе данных. Он должен сначала хотя бы один раз использовать бота (например, /start).")
                 return
@@ -2730,7 +2773,7 @@ async def cmd_give_dollars(message: Message, state: FSMContext):
             session.add(target_player)
             logging.debug(f"DEBUG: Target player {target_player.full_name}'s dollars updated to {target_player.dollars}.")
 
-            session.commit() # <--- Коммит теперь здесь, после всех add и логирования
+            await session.commit() # <--- Коммит теперь здесь, после всех add и логирования
 
             # Уведомление отправителю (отправляем в тот чат, откуда пришла команда)
             await bot.send_message(
@@ -2759,18 +2802,18 @@ async def cmd_give_dollars(message: Message, state: FSMContext):
         except Exception as e:
             logging.error(f"Error in cmd_give_dollars for user {message.from_user.id}: {e}", exc_info=True)
             await message.reply(f"Произошла ошибка при обработке команды. Попробуйте снова. {FACTION_EMOJIS['missed']}")
-            session.rollback()
+            await session.rollback()
 
  
 async def cmd_give_diamonds(message: Message, state: FSMContext):
-    with Session() as session:
-        sender_player = ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name)
+     
+        sender_player = await ensure_player_profile_exists(session, message.from_user.id, message.from_user.username, message.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: await и BOT_ID
         if sender_player is None: 
                 logging.error(f"Failed to get/create player profile for user {message.from_user.id}. Possibly bot's own ID.")
                 await message.reply(f"Произошла ошибка при загрузке вашего профиля. Попробуйте позже. {FACTION_EMOJIS['missed']}")
-                session.rollback()
+                await session.rollback()
                 return 
-        session.commit()
+        await session.commit()
 
         amount_str = None
         target_user_id = None
@@ -2823,10 +2866,11 @@ async def cmd_give_diamonds(message: Message, state: FSMContext):
 
             target_player = None
             if target_user_id:
-                target_player = session.query(Player).filter_by(user_id=target_user_id, game_id=None).first()
+                result_target_player = await session.execute(select(Player).filter_by(user_id=target_user_id, game_id=None))
+                target_player = result_target_player.scalars().first()
             elif target_username:
-                target_player = session.query(Player).filter_by(username=target_username, game_id=None).first()
-
+                result_target_player = await session.execute(select(Player).filter_by(username=target_username, game_id=None))
+                target_player = result_target_player.scalars().first()
             if not target_player:
                 await message.reply(f"Игрок {'@'+target_username if target_username else f'с ID {target_user_id}'} не найден в базе данных. Он должен сначала хотя бы один раз использовать бота (например, /start).")
                 return
@@ -2839,7 +2883,7 @@ async def cmd_give_diamonds(message: Message, state: FSMContext):
             # Добавляем Бриллианты получателю
             target_player.diamonds += amount
             session.add(target_player)
-            session.commit()
+            await session.commit()
 
             # Уведомление отправителю (отправляем в тот чат, откуда пришла команда)
             await bot.send_message(
@@ -2868,12 +2912,12 @@ async def cmd_give_diamonds(message: Message, state: FSMContext):
         except Exception as e:
             logging.error(f"Error in cmd_give_diamonds for user {message.from_user.id}: {e}", exc_info=True)
             await message.reply(f"Произошла ошибка при обработке команды. Попробуйте снова. {FACTION_EMOJIS['missed']}")
-            session.rollback()
+            await session.rollback()
 
 
 # --- НОВЫЕ FSM ХЭНДЛЕРЫ ДЛЯ СУММ ПОЖЕРТВОВАНИЙ ---
  
-async def process_donate_dollars_amount(message: Message, state: FSMContext):
+async def process_donate_dollars_amount(message: Message, state: FSMContext, session: AsyncSession):
     user_id = message.from_user.id
     data = await state.get_data()
     player_user_id_from_fsm = data.get('user_id') 
@@ -2885,61 +2929,63 @@ async def process_donate_dollars_amount(message: Message, state: FSMContext):
         if amount <= 0:
             await message.reply("Сумма пожертвования должна быть положительной.")
             return
-        with Session() as session:
-            player = session.query(Player).filter_by(user_id=player_user_id_from_fsm, game_id=None).first()
-            group = session.get(Group, selected_group_id)
+        # session уже доступна
+        player_result = await session.execute(
+            select(Player).filter_by(user_id=player_user_id_from_fsm, game_id=None)
+        )
+        player = player_result.scalars().first()
+        group = await session.get(Group, selected_group_id)
 
-            if not player or player.user_id != user_id or not group:
-                await message.reply(f"Произошла ошибка с вашим профилем или выбранной группой. Попробуйте еще раз с /donate. {FACTION_EMOJIS['missed']}")
-                await state.clear()
-                return
-
-            if not is_owner and player.dollars < amount:
-                await message.reply(f"У вас недостаточно Долларов. У вас {player.dollars}{FACTION_EMOJIS['dollars']}.")
-                return
-            
-            # Списываем только у обычных игроков
-            if not is_owner:
-                player.dollars -= amount
-            group.dollars_donated += amount
-            
-            group_experience_gain = amount * DOLLAR_TO_GROUP_EXP_RATIO
-            group.experience += group_experience_gain
-
-            await message.reply(f"Вы успешно пожертвовали {amount} Долларов {FACTION_EMOJIS['dollars']} в Фонд Города <b>{group.name}</b>! Спасибо за ваш вклад. {RESULT_EMOJIS['success']}", parse_mode=ParseMode.HTML)
-            logging.info(f"Player {player.full_name} ({player.user_id}) donated {amount} Dollars to group {group.name}.")
-
-            # Проверяем повышение уровня группы
-            while group.experience >= (BASE_GROUP_EXP_FOR_LEVEL_UP + (group.level * GROUP_LEVEL_UP_EXP_INCREMENT)):
-                group.level += 1
-                exp_needed_for_previous_level_up = BASE_GROUP_EXP_FOR_LEVEL_UP + ((group.level - 1) * GROUP_LEVEL_UP_EXP_INCREMENT)
-                group.experience -= exp_needed_for_previous_level_up
-                
-                level_bonus_key = min(group.level, max(GROUP_LEVEL_BONUSES.keys()))
-                level_bonus = GROUP_LEVEL_BONUSES.get(level_bonus_key, GROUP_LEVEL_BONUSES.get(max(GROUP_LEVEL_BONUSES.keys())))
-                group.bonus_exp_percent = level_bonus['exp_percent']
-                group.bonus_dollars_percent = level_bonus['dollars_percent']
-                group.bonus_item_chance = level_bonus['item_chance']
-
-                await bot.send_message(group.chat_id,
-                                       f"Поздравляем! {FACTION_EMOJIS['town']} Уровень Города <b>{group.name}</b> повышен до <b>{group.level}</b>!\n"
-                                       f"Теперь все игроки в этой группе получают: +{group.bonus_exp_percent*100:.0f}% к опыту, +{group.bonus_dollars_percent*100:.0f}% к Долларам.",
-                                       parse_mode=ParseMode.HTML)
-
-            session.add(player)
-            session.add(group)
-            session.commit()
+        if not player or player.user_id != user_id or not group:
+            await message.reply(f"Произошла ошибка с вашим профилем или выбранной группой. Попробуйте еще раз с /donate. {FACTION_EMOJIS['missed']}")
             await state.clear()
+            return
+
+        if not is_owner and player.dollars < amount:
+            await message.reply(f"У вас недостаточно Долларов. У вас {player.dollars}{FACTION_EMOJIS['dollars']}.")
+            return
+        
+        # Списываем только у обычных игроков
+        if not is_owner:
+            player.dollars -= amount
+        group.dollars_donated += amount
+        
+        group_experience_gain = amount * DOLLAR_TO_GROUP_EXP_RATIO
+        group.experience += group_experience_gain
+
+        await message.reply(f"Вы успешно пожертвовали {amount} Долларов {FACTION_EMOJIS['dollars']} в Фонд Города <b>{group.name}</b>! Спасибо за ваш вклад. {RESULT_EMOJIS['success']}", parse_mode=ParseMode.HTML)
+        logging.info(f"Player {player.full_name} ({player.user_id}) donated {amount} Dollars to group {group.name}.")
+
+        # Проверяем повышение уровня группы
+        while group.experience >= (BASE_GROUP_EXP_FOR_LEVEL_UP + (group.level * GROUP_LEVEL_UP_EXP_INCREMENT)):
+            group.level += 1
+            exp_needed_for_previous_level_up = BASE_GROUP_EXP_FOR_LEVEL_UP + ((group.level - 1) * GROUP_LEVEL_UP_EXP_INCREMENT)
+            group.experience -= exp_needed_for_previous_level_up
+            
+            level_bonus_key = min(group.level, max(GROUP_LEVEL_BONUSES.keys()))
+            level_bonus = GROUP_LEVEL_BONUSES.get(level_bonus_key, GROUP_LEVEL_BONUSES.get(max(GROUP_LEVEL_BONUSES.keys())))
+            group.bonus_exp_percent = level_bonus['exp_percent']
+            group.bonus_dollars_percent = level_bonus['dollars_percent']
+            group.bonus_item_chance = level_bonus['item_chance']
+
+            await bot.send_message(group.chat_id,
+                                   f"Поздравляем! {FACTION_EMOJIS['town']} Уровень Города <b>{group.name}</b> повышен до <b>{group.level}</b>!\n"
+                                   f"Теперь все игроки в этой группе получают: +{group.bonus_exp_percent*100:.0f}% к опыту, +{group.bonus_dollars_percent*100:.0f}% к Долларам.",
+                                   parse_mode=ParseMode.HTML)
+
+        session.add(player)
+        session.add(group)
+        await session.commit() # <-- ИЗМЕНИЛИ
+        await state.clear()
 
     except ValueError:
         await message.reply("Неверный формат. Пожалуйста, введите целое число для Долларов.")
     except Exception as e:
         logging.error(f"Ошибка при обработке пожертвования Долларов от {user_id}: {e}", exc_info=True)
         await message.reply(f"Произошла ошибка при обработке вашего пожертвования. {FACTION_EMOJIS['missed']}")
-        session.rollback()
+        await session.rollback() # <-- ИЗМЕНИЛИ
     finally:
         await state.clear()
-
 
  
 async def process_donate_diamonds_amount(message: Message, state: FSMContext):
@@ -2956,139 +3002,148 @@ async def process_donate_diamonds_amount(message: Message, state: FSMContext):
             await message.reply("Сумма пожертвования должна быть положительной.")
             return
 
-        with Session() as session:
-            player = session.query(Player).filter_by(user_id=player_user_id_from_fsm, game_id=None).first() 
-            group = session.get(Group, selected_group_id)
+        # session уже доступна
+        player_result = await session.execute(
+            select(Player).filter_by(user_id=player_user_id_from_fsm, game_id=None)
+        )
+        player = player_result.scalars().first()
+        group = await session.get(Group, selected_group_id)
 
-            if not player or player.user_id != user_id or not group:
-                await message.reply(f"Произошла ошибка с вашим профилем или выбранной группой. Попробуйте еще раз с /donate. {FACTION_EMOJIS['missed']}")
-                await state.clear()
-                return
-            if not is_owner and player.diamonds < amount:
-                await message.reply(f"У вас недостаточно Бриллиантов. У вас {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.")
-                return
-            
-            # Списываем только у обычных игроков
-            if not is_owner:
-                player.diamonds -= amount
-            group.diamonds_donated += amount
-            
-            group_experience_gain = amount * DIAMOND_TO_GROUP_EXP_RATIO
-            group.experience += group_experience_gain
-
-            await message.reply(f"Вы успешно пожертвовали {amount:.2f} Бриллиантов {FACTION_EMOJIS['diamonds']} в Фонд Города <b>{group.name}</b>! Спасибо за ваш ценный вклад. {RESULT_EMOJIS['success']}", parse_mode=ParseMode.HTML)
-            logging.info(f"Player {player.full_name} ({player.user_id}) donated {amount:.2f} Diamonds to group {group.name}.")
-
-            # Проверяем повышение уровня группы
-            while group.experience >= (BASE_GROUP_EXP_FOR_LEVEL_UP + (group.level * GROUP_LEVEL_UP_EXP_INCREMENT)):
-                group.level += 1
-                exp_needed_for_previous_level_up = BASE_GROUP_EXP_FOR_LEVEL_UP + ((group.level - 1) * GROUP_LEVEL_UP_EXP_INCREMENT)
-                group.experience -= exp_needed_for_previous_level_up
-                
-                level_bonus_key = min(group.level, max(GROUP_LEVEL_BONUSES.keys()))
-                level_bonus = GROUP_LEVEL_BONUSES.get(level_bonus_key, GROUP_LEVEL_BONUSES.get(max(GROUP_LEVEL_BONUSES.keys())))
-                group.bonus_exp_percent = level_bonus['exp_percent']
-                group.bonus_dollars_percent = level_bonus['dollars_percent']
-                group.bonus_item_chance = level_bonus['item_chance']
-
-                await bot.send_message(group.chat_id,
-                                       f"Поздравляем! {FACTION_EMOJIS['town']} Уровень Города <b>{group.name}</b> повышен до <b>{group.level}</b>!\n"
-                                       f"Теперь все игроки в этой группе получают: +{group.bonus_exp_percent*100:.0f}% к опыту, +{group.bonus_dollars_percent*100:.0f}% к Долларам.",
-                                       parse_mode=ParseMode.HTML)
-
-            session.add(player)
-            session.add(group)
-            session.commit()
+        if not player or player.user_id != user_id or not group:
+            await message.reply(f"Произошла ошибка с вашим профилем или выбранной группой. Попробуйте еще раз с /donate. {FACTION_EMOJIS['missed']}")
             await state.clear()
+            return
+        if not is_owner and player.diamonds < amount:
+            await message.reply(f"У вас недостаточно Бриллиантов. У вас {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.")
+            return
+        
+        # Списываем только у обычных игроков
+        if not is_owner:
+            player.diamonds -= amount
+        group.diamonds_donated += amount
+        
+        group_experience_gain = amount * DIAMOND_TO_GROUP_EXP_RATIO
+        group.experience += group_experience_gain
+
+        await message.reply(f"Вы успешно пожертвовали {amount:.2f} Бриллиантов {FACTION_EMOJIS['diamonds']} в Фонд Города <b>{group.name}</b>! Спасибо за ваш ценный вклад. {RESULT_EMOJIS['success']}", parse_mode=ParseMode.HTML)
+        logging.info(f"Player {player.full_name} ({player.user_id}) donated {amount:.2f} Diamonds to group {group.name}.")
+
+        # Проверяем повышение уровня группы
+        while group.experience >= (BASE_GROUP_EXP_FOR_LEVEL_UP + (group.level * GROUP_LEVEL_UP_EXP_INCREMENT)):
+            group.level += 1
+            exp_needed_for_previous_level_up = BASE_GROUP_EXP_FOR_LEVEL_UP + ((group.level - 1) * GROUP_LEVEL_UP_EXP_INCREMENT)
+            group.experience -= exp_needed_for_previous_level_up
+            
+            level_bonus_key = min(group.level, max(GROUP_LEVEL_BONUSES.keys()))
+            level_bonus = GROUP_LEVEL_BONUSES.get(level_bonus_key, GROUP_LEVEL_BONUSES.get(max(GROUP_LEVEL_BONUSES.keys())))
+            group.bonus_exp_percent = level_bonus['exp_percent']
+            group.bonus_dollars_percent = level_bonus['dollars_percent']
+            group.bonus_item_chance = level_bonus['item_chance']
+
+            await bot.send_message(group.chat_id,
+                                   f"Поздравляем! {FACTION_EMOJIS['town']} Уровень Города <b>{group.name}</b> повышен до <b>{group.level}</b>!\n"
+                                   f"Теперь все игроки в этой группе получают: +{group.bonus_exp_percent*100:.0f}% к опыту, +{group.bonus_dollars_percent*100:.0f}% к Долларам.",
+                                   parse_mode=ParseMode.HTML)
+
+        session.add(player)
+        session.add(group)
+        await session.commit() # <-- ИЗМЕНИЛИ
+        await state.clear()
 
     except ValueError:
         await message.reply("Неверный формат. Пожалуйста, введите число (можно дробное) для Бриллиантов.")
     except Exception as e:
         logging.error(f"Ошибка при обработке пожертвования Бриллиантов от {user_id}: {e}", exc_info=True)
         await message.reply(f"Произошла ошибка при обработке вашего пожертвования. {FACTION_EMOJIS['missed']}")
-        session.rollback()
+        await session.rollback() # <-- ИЗМЕНИЛИ
     finally:
         await state.clear()
 # --- КОНЕЦ НОВЫХ FSM ХЭНДЛЕРОВ ДЛЯ СУММ ПОЖЕРТВОВАНИЙ ---
 
 
  
-async def callback_vote(query: CallbackQuery):
-    with Session() as session:
-        try:
-            if query.message.chat.type != ChatType.PRIVATE:
-                await query.answer(f"Это действие можно выполнить только в личной переписке с ботом. {FACTION_EMOJIS['missed']}", show_alert=True)
-                return
+async def callback_vote(query: CallbackQuery, session: AsyncSession):
+    
+    try:
+        if query.message.chat.type != ChatType.PRIVATE:
+            await query.answer(f"Это действие можно выполнить только в личной переписке с ботом. {FACTION_EMOJIS['missed']}", show_alert=True)
+            return
 
-            parts = query.data.split('_')
-            game_id = int(parts[1])
-            target_player_id = int(parts[2])
+        parts = query.data.split('_')
+        game_id = int(parts[1])
+        target_player_id = int(parts[2])
 
-            player_in_private = session.query(Player).filter_by(user_id=query.from_user.id, game_id=game_id, is_alive=True).first()
-            if not player_in_private:
-                await query.answer(f"Вы не участвуете в этой игре или уже мертвы. {PHASE_EMOJIS['death']}", show_alert=True)
-                return
+        player_in_private_result = await session.execute(
+            select(Player).filter_by(user_id=query.from_user.id, game_id=game_id, is_alive=True)
+        )
+        player_in_private = player_in_private_result.scalars().first()
+        if not player_in_private:
+            await query.answer(f"Вы не участвуете в этой игре или уже мертвы. {PHASE_EMOJIS['death']}", show_alert=True)
+            return
 
-            game = session.get(Game, player_in_private.game_id)
-            if not game or game.status != 'playing' or game.phase != 'voting':
-                await query.answer(f"Сейчас не фаза голосования или игра не активна. {FACTION_EMOJIS['missed']}", show_alert=True)
-                return
+        game = await session.get(Game, player_in_private.game_id)
+        if not game or game.status != 'playing' or game.phase != 'voting':
+            await query.answer(f"Сейчас не фаза голосования или игра не активна. {FACTION_EMOJIS['missed']}", show_alert=True)
+            return
 
-            target_player = session.query(Player).filter_by(id=target_player_id, game_id=game.id, is_alive=True).first()
+        target_player_result = await session.execute(
+            select(Player).filter_by(id=target_player_id, game_id=game.id, is_alive=True)
+        )
+        target_player = target_player_result.scalars().first()
 
-            if not target_player:
-                await query.answer(f"Игрок не найден в игре или уже мертв. {PHASE_EMOJIS['death']}", show_alert=True)
-                return
+        if not target_player:
+            await query.answer(f"Игрок не найден в игре или уже мертв. {PHASE_EMOJIS['death']}", show_alert=True)
+            return
 
-            if player_in_private.id == target_player.id:
-                await query.answer(f"Вы не можете голосовать за себя. {FACTION_EMOJIS['missed']}", show_alert=True)
-                return
-            
-            if player_in_private.voted_for_player_id:
-                await query.answer("Вы уже проголосовали в этой фазе. Вы можете изменить свой голос.", show_alert=False)
-            
-            player_in_private.voted_for_player_id = target_player.id
-            session.add(player_in_private)
-            session.commit()
-            logging.info(f"Player {player_in_private.full_name} ({player_in_private.user_id}) voted for {target_player.full_name} in game {game_id}.")
+        if player_in_private.id == target_player.id:
+            await query.answer(f"Вы не можете голосовать за себя. {FACTION_EMOJIS['missed']}", show_alert=True)
+            return
+        
+        if player_in_private.voted_for_player_id:
+            await query.answer("Вы уже проголосовали в этой фазе. Вы можете изменить свой голос.", show_alert=False)
+        
+        player_in_private.voted_for_player_id = target_player.id
+        session.add(player_in_private)
+        await session.commit() # <-- ИЗМЕНИЛИ
+        logging.info(f"Player {player_in_private.full_name} ({player_in_private.user_id}) voted for {target_player.full_name} in game {game_id}.")
 
-            await bot.send_message(
-                chat_id=game.chat_id,
-                text=f"{ROLE_EMOJIS['civilian']} <a href='tg://user?id={player_in_private.user_id}'>{player_in_private.full_name}</a> проголосовал за <a href='tg://user?id={target_player.user_id}'>{target_player.full_name}</a>",
-                parse_mode=ParseMode.HTML
-            )
+        await bot.send_message(
+            chat_id=game.chat_id,
+            text=f"{ROLE_EMOJIS['civilian']} <a href='tg://user?id={player_in_private.user_id}'>{player_in_private.full_name}</a> проголосовал за <a href='tg://user?id={target_player.user_id}'>{target_player.full_name}</a>",
+            parse_mode=ParseMode.HTML
+        )
 
-            await query.answer(f"Вы успешно проголосовали за {target_player.full_name}.", show_alert=False)
+        await query.answer(f"Вы успешно проголосовали за {target_player.full_name}.", show_alert=False)
 
-            await query.message.edit_text(
-                f"Вы проголосовали за <b>{target_player.full_name}</b>. "
-                f"Ваш голос учтен. Ждем голосов других игроков. {PHASE_EMOJIS['voting']}",
-                reply_markup=None
-            )
+        await query.message.edit_text(
+            f"Вы проголосовали за <b>{target_player.full_name}</b>. "
+            f"Ваш голос учтен. Ждем голосов других игроков. {PHASE_EMOJIS['voting']}",
+            reply_markup=None
+        )
 
-        except Exception as e:
-            logging.error(
-                f"Ошибка при обработке голосования через кнопку от {query.from_user.id} в игре {game_id if 'game_id' in locals() else 'Unknown'}: {e}", exc_info=True)
-            await query.answer(f"Произошла ошибка при голосовании. Попробуйте позже. {FACTION_EMOJIS['missed']}", show_alert=True)
-            session.rollback()
-
+    except Exception as e:
+        logging.error(
+            f"Ошибка при обработке голосования через кнопку от {query.from_user.id} в игре {game_id if 'game_id' in locals() else 'Unknown'}: {e}", exc_info=True)
+        await query.answer(f"Произошла ошибка при голосовании. Попробуйте позже. {FACTION_EMOJIS['missed']}", show_alert=True)
+        await session.rollback() # <-- ИЗМЕНИЛИ
 
  
 async def callback_lynch_vote(query: CallbackQuery):
-    with Session() as session:
+     
         try:
             parts = query.data.split('_')
             action = parts[1]
             game_id = int(parts[2])
 
-            game = session.get(Game, game_id)
+            game = await session.get(Game, game_id)
             if not game or game.status != 'playing' or game.phase != 'lynch_vote' or not game.voted_for_player_id:
                 await query.answer(f"Сейчас не фаза голосования за казнь, игра не активна или нет цели. {PHASE_EMOJIS['voting']}",
                                    show_alert=True)
                 return
 
             voter_user_id = query.from_user.id
-            voter = session.query(Player).filter_by(user_id=voter_user_id, game_id=game.id, is_alive=True).first()
+            result_voter = await session.execute(select(Player).filter_by(user_id=voter_user_id, game_id=game.id, is_alive=True))
+            voter = result_voter.scalars().first()
             if not voter:
                 await query.answer(f"Вы не участвуете в этой игре или уже мертвы. {PHASE_EMOJIS['death']}", show_alert=True)
                 return
@@ -3109,7 +3164,7 @@ async def callback_lynch_vote(query: CallbackQuery):
             game.lynch_voters = ",".join(map(str, voters_list))
 
             session.add(game)
-            session.commit()
+            await session.commit()
             logging.info(f"Player{voter.full_name} ({voter.user_id}) voted {'FOR' if action == 'like' else 'AGAINST'} lynch in game {game_id}.")
 
             executed_player = session.get(Player, game.voted_for_player_id)
@@ -3158,11 +3213,11 @@ async def callback_lynch_vote(query: CallbackQuery):
             logging.error(f"Ошибка при обработке голосования за казнь от {query.from_user.id} в игре {game_id if 'game_id' in locals() else 'Unknown'}: {e}",
                           exc_info=True)
             await query.answer(f"Произошла ошибка при голосовании за казнь. Попробуйте позже. {FACTION_EMOJIS['missed']}", show_alert=True)
-            session.rollback()
+            await session.rollback()
 
 
 async def callback_mafia_kill(query: CallbackQuery):
-    with Session() as session:
+     
         try:
             if query.message.chat.type != ChatType.PRIVATE:
                 await query.answer(f"Это действие можно выполнить только в личной переписке с ботом. {FACTION_EMOJIS['missed']}", show_alert=True)
@@ -3172,7 +3227,8 @@ async def callback_mafia_kill(query: CallbackQuery):
             game_id = int(parts[2])
             target_player_id = int(parts[3])
 
-            player = session.query(Player).filter_by(user_id=query.from_user.id, game_id=game_id, is_alive=True).first()
+            result_player = await session.execute(select(Player).filter_by(user_id=query.from_user.id, game_id=game_id, is_alive=True))
+            player = result_player.scalars().first()
             if not player or player.game_id != game_id:
                 await query.answer(f"Вы не участвуете в этой игре или уже мертвы. {PHASE_EMOJIS['death']}", show_alert=True)
                 return
@@ -3182,8 +3238,8 @@ async def callback_mafia_kill(query: CallbackQuery):
                 await query.answer(f"Сейчас не ваша очередь действовать или вы не Мафия. {FACTION_EMOJIS['missed']}", show_alert=True)
                 return
 
-            target_player = session.query(Player).filter_by(id=target_player_id, game_id=game.id, is_alive=True).first()
-
+            result_target_player = await session.execute(select(Player).filter_by(id=target_player_id, game_id=game.id, is_alive=True))
+            target_player = result_target_player.scalars().first()
             if not target_player:
                 await query.answer(f"Цель не найдена в игре или уже мертва. {PHASE_EMOJIS['death']}", show_alert=True)
                 return
@@ -3198,7 +3254,7 @@ async def callback_mafia_kill(query: CallbackQuery):
 
             player.night_action_target_id = target_player.id
             session.add(player)
-            session.commit()
+            await session.commit()
             logging.info(f"Mafia player {player.full_name} ({player.user_id}) chose to kill {target_player.full_name} in game {game_id}.")
 
             await query.message.edit_text(
@@ -3207,11 +3263,12 @@ async def callback_mafia_kill(query: CallbackQuery):
             )
             await query.answer(f"Вы выбрали убить {target_player.full_name}.", show_alert=False)
 
-            mafia_allies_and_self = session.query(Player).filter(
+            result_mafia_allies_and_self = await session.execute(select(Player).filter(
                 Player.game_id == game.id,
                 Player.is_alive == True,
                 Player.role.in_(['mafia', 'don'])
-            ).all()
+            ))
+            mafia_allies_and_self = result_mafia_allies_and_self.scalars().all()
 
             notification_message = f"{ROLE_EMOJIS[player.role]} <b>{player.full_name}</b> Сделал выбор: {target_player.full_name}"
             for ally in mafia_allies_and_self:
@@ -3226,11 +3283,11 @@ async def callback_mafia_kill(query: CallbackQuery):
         except Exception as e:
             logging.error(f"Error in mafia_kill for {query.from_user.id}: {e}", exc_info=True)
             await query.answer(f"Произошла ошибка. Попробуйте позже. {FACTION_EMOJIS['missed']}", show_alert=True)
-            session.rollback()
+            await session.rollback()
 
 
 async def callback_doctor_heal(query: CallbackQuery):
-    with Session() as session:
+     
         try:
             if query.message.chat.type != ChatType.PRIVATE:
                 await query.answer(f"Это действие можно выполнить только в личной переписке с ботом. {FACTION_EMOJIS['missed']}", show_alert=True)
@@ -3240,7 +3297,8 @@ async def callback_doctor_heal(query: CallbackQuery):
             game_id = int(parts[2])
             target_player_id = int(parts[3])
 
-            player = session.query(Player).filter_by(user_id=query.from_user.id, game_id=game_id, is_alive=True).first()
+            result_player = await session.execute(select(Player).filter_by(user_id=query.from_user.id, game_id=game_id, is_alive=True))
+            player = result_player.scalars().first()
             if not player or player.game_id != game_id:
                 await query.answer(f"Вы не участвуете в этой игре или уже мертвы. {PHASE_EMOJIS['death']}", show_alert=True)
                 return
@@ -3250,15 +3308,15 @@ async def callback_doctor_heal(query: CallbackQuery):
                 await query.answer(f"Сейчас не ваша очередь действовать или вы не Доктор. {FACTION_EMOJIS['missed']}", show_alert=True)
                 return
 
-            target_player = session.query(Player).filter_by(id=target_player_id, game_id=game.id, is_alive=True).first()
-
+            result_target_player = await session.execute(select(Player).filter_by(id=target_player_id, game_id=game.id, is_alive=True))
+            target_player = result_target_player.scalars().first()
             if not target_player:
                 await query.answer(f"Цель не найдена в игре или уже мертва. {PHASE_EMOJIS['death']}", show_alert=True)
                 return
 
             player.night_action_target_id = target_player.id
             session.add(player)
-            session.commit()
+            await session.commit()
             logging.info(f"Doctor player {player.full_name} ({player.user_id}) chose to heal {target_player.full_name} in game {game_id}.")
 
             await query.message.edit_text(
@@ -3276,11 +3334,11 @@ async def callback_doctor_heal(query: CallbackQuery):
                 f"Ошибка при обработке действия Доктора от {query.from_user.id} в игре {game_id if 'game_id' in locals() else 'Unknown'}: {e}",
                 exc_info=True)
             await query.answer(f"Произошла ошибка. Попробуйте позже. {FACTION_EMOJIS['missed']}", show_alert=True)
-            session.rollback()
+            await session.rollback()
 
 
 async def callback_commissioner_check(query: CallbackQuery):
-    with Session() as session:
+     
         try:
             if query.message.chat.type != ChatType.PRIVATE:
                 await query.answer(f"Это действие можно выполнить только в личной переписке с ботом. {FACTION_EMOJIS['missed']}", show_alert=True)
@@ -3290,7 +3348,8 @@ async def callback_commissioner_check(query: CallbackQuery):
             game_id = int(parts[2])
             target_player_id = int(parts[3])
 
-            player = session.query(Player).filter_by(user_id=query.from_user.id, game_id=game_id, is_alive=True).first()
+            result_player = await session.execute(select(Player).filter_by(user_id=query.from_user.id, game_id=game_id, is_alive=True))
+            player = result_player.scalars().first()
             if not player or player.game_id != game_id:
                 await query.answer(f"Вы не участвуете в этой игре или уже мертвы. {PHASE_EMOJIS['death']}", show_alert=True)
                 return
@@ -3300,8 +3359,8 @@ async def callback_commissioner_check(query: CallbackQuery):
                 await query.answer(f"Сейчас не ваша очередь действовать или вы не Комиссар. {FACTION_EMOJIS['missed']}", show_alert=True)
                 return
 
-            target_player = session.query(Player).filter_by(id=target_player_id, game_id=game.id, is_alive=True).first()
-
+            result_target_player = await session.execute(select(Player).filter_by(id=target_player_id, game_id=game.id, is_alive=True))
+            target_player = result_target_player.scalars().first()
             if not target_player:
                 await query.answer(f"Цель не найдена в игре или уже мертва. {PHASE_EMOJIS['death']}", show_alert=True)
                 return
@@ -3312,7 +3371,7 @@ async def callback_commissioner_check(query: CallbackQuery):
 
             player.night_action_target_id = target_player.id
             session.add(player)
-            session.commit()
+            await session.commit()
             logging.info(f"Commissioner player {player.full_name} ({player.user_id}) chose to check {target_player.full_name} in game {game_id}.")
 
             is_mafia_faction = target_player.role in ['mafia', 'don']
@@ -3339,11 +3398,11 @@ async def callback_commissioner_check(query: CallbackQuery):
                 f"Ошибка при обработке действия Комиссара от {query.from_user.id} в игре {game_id if 'game_id' in locals() else 'Unknown'}: {e}",
                 exc_info=True)
             await query.answer(f"Произошла ошибка. Попробуйте позже. {FACTION_EMOJIS['missed']}", show_alert=True)
-            session.rollback()
+            await session.rollback()
 
   
 async def callback_maniac_kill(query: CallbackQuery):
-    with Session() as session:
+     
         try:
             if query.message.chat.type != ChatType.PRIVATE:
                 await query.answer(f"Это действие можно выполнить только в личной переписке с ботом. {FACTION_EMOJIS['missed']}", show_alert=True)
@@ -3353,7 +3412,8 @@ async def callback_maniac_kill(query: CallbackQuery):
             game_id = int(parts[2])
             target_player_id = int(parts[3])
 
-            player = session.query(Player).filter_by(user_id=query.from_user.id, game_id=game_id, is_alive=True).first()
+            result_player = await session.execute(select(Player).filter_by(user_id=query.from_user.id, game_id=game_id, is_alive=True))
+            player = result_player.scalars().first()
             if not player or player.game_id != game_id:
                 await query.answer(f"Вы не участвуете в этой игре или уже мертвы. {PHASE_EMOJIS['death']}", show_alert=True)
                 return
@@ -3363,8 +3423,8 @@ async def callback_maniac_kill(query: CallbackQuery):
                 await query.answer(f"Сейчас не ваша очередь действовать или вы не Маньяк. {FACTION_EMOJIS['missed']}", show_alert=True)
                 return
 
-            target_player = session.query(Player).filter_by(id=target_player_id, game_id=game.id, is_alive=True).first()
-
+            result_target_player = await session.execute(select(Player).filter_by(id=target_player_id, game_id=game.id, is_alive=True))
+            target_player = result_target_player.scalars().first()
             if not target_player:
                 await query.answer(f"Цель не найдена в игре или уже мертва. {PHASE_EMOJIS['death']}", show_alert=True)
                 return
@@ -3375,7 +3435,7 @@ async def callback_maniac_kill(query: CallbackQuery):
 
             player.night_action_target_id = target_player.id
             session.add(player)
-            session.commit()
+            await session.commit()
             logging.info(f"Maniac player {player.full_name} ({player.user_id}) chose to kill {target_player.full_name} in game {game_id}.")
 
             await query.message.edit_text(
@@ -3391,328 +3451,328 @@ async def callback_maniac_kill(query: CallbackQuery):
         except Exception as e:
             logging.error(f"Error in maniac_kill for {query.from_user.id}: {e}", exc_info=True)
             await query.answer(f"Произошла ошибка. Попробуйте позже. {FACTION_EMOJIS['missed']}", show_alert=True)
-            session.rollback()
+            await session.rollback()
  
 async def callback_select_frame_prompt(query: CallbackQuery, state: FSMContext):
     await query.answer()
-    with Session() as session:
-        player = ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name)
-        if not player:
-            await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            return
+     
+    player = await ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: await и BOT_ID
+    if not player:
+        await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        return
 
-        unlocked_frames = json.loads(player.unlocked_frames)
+    unlocked_frames = json.loads(player.unlocked_frames)
             
-        keyboard_buttons = []
-        for frame_id, frame_data in CUSTOM_FRAMES.items():
-            is_selected = (frame_id == player.selected_frame)
-            is_unlocked = (frame_id in unlocked_frames)
+    keyboard_buttons = []
+    for frame_id, frame_data in CUSTOM_FRAMES.items():
+        is_selected = (frame_id == player.selected_frame)
+        is_unlocked = (frame_id in unlocked_frames)
                 
-            button_text = f"{frame_data['name_ru']}"
-            if is_selected:
-                button_text += " (Выбрано)"
-            elif not is_unlocked:
-                price_dollars = frame_data.get('price_dollars', 0)
-                price_diamonds = frame_data.get('price_diamonds', 0.0)
-                if price_dollars > 0:
-                    button_text += f" ({price_dollars}{FACTION_EMOJIS['dollars']})"
-                if price_diamonds > 0:
-                    button_text += f" ({price_diamonds:.1f}{FACTION_EMOJIS['diamonds']})"
+        button_text = f"{frame_data['name_ru']}"
+        if is_selected:
+            button_text += " (Выбрано)"
+        elif not is_unlocked:
+            price_dollars = frame_data.get('price_dollars', 0)
+            price_diamonds = frame_data.get('price_diamonds', 0.0)
+            if price_dollars > 0:
+                button_text += f" ({price_dollars}{FACTION_EMOJIS['dollars']})"
+            if price_diamonds > 0:
+                button_text += f" ({price_diamonds:.1f}{FACTION_EMOJIS['diamonds']})"
                 
-            keyboard_buttons.append(
-                InlineKeyboardButton(
-                    text=button_text,
-                    callback_data=f"preview_frame_{frame_id}" # МЕНЯЕМ COLLBACK_DATA НА ПРЕДПРОСМОТР
-                )
+        keyboard_buttons.append(
+            InlineKeyboardButton(
+                text=button_text,
+                callback_data=f"preview_frame_{frame_id}" # МЕНЯЕМ COLLBACK_DATA НА ПРЕДПРОСМОТР
             )
-
-        inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            keyboard_buttons[i:i + 1] for i in range(0, len(keyboard_buttons), 1)
-        ] + [[InlineKeyboardButton(text="?? Назад в профиль", callback_data="back_to_profile")]]) # КНОПКА НАЗАД
-            
-        is_owner = (query.from_user.id == BOT_OWNER_ID)
-        dollars_display = "?" if is_owner else str(player.dollars)
-        diamonds_display = "?" if is_owner else f"{player.diamonds:.2f}"
-
-        await query.message.edit_text(
-            f"Выберите рамку для вашего профиля. У вас {dollars_display}{FACTION_EMOJIS['dollars']} и {diamonds_display}{FACTION_EMOJIS['diamonds']}.",
-            reply_markup=inline_keyboard,
-            parse_mode=ParseMode.HTML
         )
-        await state.set_state(GameState.waiting_for_frame_selection) # Состояние выбора (чтобы ловить preview_frame_)
+
+    inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        keyboard_buttons[i:i + 1] for i in range(0, len(keyboard_buttons), 1)
+    ] + [[InlineKeyboardButton(text="?? Назад в профиль", callback_data="back_to_profile")]]) # КНОПКА НАЗАД
+            
+    is_owner = (query.from_user.id == BOT_OWNER_ID)
+    dollars_display = "?" if is_owner else str(player.dollars)
+    diamonds_display = "?" if is_owner else f"{player.diamonds:.2f}"
+
+    await query.message.edit_text(
+        f"Выберите рамку для вашего профиля. У вас {dollars_display}{FACTION_EMOJIS['dollars']} и {diamonds_display}{FACTION_EMOJIS['diamonds']}.",
+        reply_markup=inline_keyboard,
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(GameState.waiting_for_frame_selection) # Состояние выбора (чтобы ловить preview_frame_)
 
  
 async def callback_select_frame(query: CallbackQuery, state: FSMContext):
     await query.answer()
     frame_id = query.data.split('_')[2]
 
-    with Session() as session:
-        player = ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name)
-        if not player:
-            await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            await state.clear()
-            return
+     
+    player = await ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: await и BOT_ID
+    if not player:
+        await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        await state.clear()
+        return
         
-        if frame_id not in CUSTOM_FRAMES:
-            await query.message.edit_text(f"Ошибка: Неизвестная рамка. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            await state.clear()
-            return
+    if frame_id not in CUSTOM_FRAMES:
+        await query.message.edit_text(f"Ошибка: Неизвестная рамка. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        await state.clear()
+        return
         
-        frame_data = CUSTOM_FRAMES[frame_id]
-        unlocked_frames = json.loads(player.unlocked_frames)
+    frame_data = CUSTOM_FRAMES[frame_id]
+    unlocked_frames = json.loads(player.unlocked_frames)
         
-        if frame_id not in unlocked_frames:
-            # Попытка купить рамку
-            price_dollars = frame_data.get('price_dollars', 0)
-            price_diamonds = frame_data.get('price_diamonds', 0.0)
+    if frame_id not in unlocked_frames:
+        # Попытка купить рамку
+        price_dollars = frame_data.get('price_dollars', 0)
+        price_diamonds = frame_data.get('price_diamonds', 0.0)
 
-            can_afford = True
-            if price_dollars > 0 and player.dollars < price_dollars and player.user_id != BOT_OWNER_ID:
-                can_afford = False
-            if price_diamonds > 0 and player.diamonds < price_diamonds and player.user_id != BOT_OWNER_ID:
-                can_afford = False
+        can_afford = True
+        if price_dollars > 0 and player.dollars < price_dollars and player.user_id != BOT_OWNER_ID:
+            can_afford = False
+        if price_diamonds > 0 and player.diamonds < price_diamonds and player.user_id != BOT_OWNER_ID:
+            can_afford = False
 
-            if not can_afford:
-                await query.message.edit_text(
-                    f"У вас недостаточно средств, чтобы купить рамку <b>{frame_data['name_ru']}</b>. "
-                    f"Требуется: {price_dollars}{FACTION_EMOJIS['dollars']} и {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}.\n"
-                    f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']} и {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=None
-                )
-                await state.clear()
-                return
-
-            # Списываем средства
-            if player.user_id != BOT_OWNER_ID:
-                player.dollars -= price_dollars
-                player.diamonds -= price_diamonds
-            
-            unlocked_frames.append(frame_id)
-            player.unlocked_frames = json.dumps(unlocked_frames)
-            session.add(player)
-            session.commit()
-            
-            # В callback_select_frame:
-            current_dollars_display = "?" if player.user_id == BOT_OWNER_ID else str(player.dollars)
-            current_diamonds_display = "?" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
+        if not can_afford:
             await query.message.edit_text(
-                f"Вы купили и выбрали рамку <b>{frame_data['name_ru']}</b>! {RESULT_EMOJIS['success']}\n"
-                f"Текущий баланс: {current_dollars_display}{FACTION_EMOJIS['dollars']}, {current_diamonds_display}{FACTION_EMOJIS['diamonds']}.",
+                f"У вас недостаточно средств, чтобы купить рамку <b>{frame_data['name_ru']}</b>. "
+                f"Требуется: {price_dollars}{FACTION_EMOJIS['dollars']} и {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}.\n"
+                f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']} и {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=None
             )
-            logging.info(f"Player {player.full_name} ({player.user_id}) bought and selected frame '{frame_id}'.")
             await state.clear()
             return
 
-        # Если рамка уже разблокирована, просто выбираем её
-        player.selected_frame = frame_id
+            # Списываем средства
+        if player.user_id != BOT_OWNER_ID:
+            player.dollars -= price_dollars
+            player.diamonds -= price_diamonds
+            
+        unlocked_frames.append(frame_id)
+        player.unlocked_frames = json.dumps(unlocked_frames)
         session.add(player)
-        session.commit()
-        
+        await session.commit()
+            
+            # В callback_select_frame:
+        current_dollars_display = "?" if player.user_id == BOT_OWNER_ID else str(player.dollars)
+        current_diamonds_display = "?" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
         await query.message.edit_text(
-            f"Вы выбрали рамку <b>{frame_data['name_ru']}</b>. {RESULT_EMOJIS['success']}\n"
-            f"Проверьте свой профиль с помощью /profile.",
+            f"Вы купили и выбрали рамку <b>{frame_data['name_ru']}</b>! {RESULT_EMOJIS['success']}\n"
+            f"Текущий баланс: {current_dollars_display}{FACTION_EMOJIS['dollars']}, {current_diamonds_display}{FACTION_EMOJIS['diamonds']}.",
             parse_mode=ParseMode.HTML,
             reply_markup=None
         )
-        logging.info(f"Player {player.full_name} ({player.user_id}) selected frame '{frame_id}'.")
+        logging.info(f"Player {player.full_name} ({player.user_id}) bought and selected frame '{frame_id}'.")
         await state.clear()
+        return
+
+        # Если рамка уже разблокирована, просто выбираем её
+    player.selected_frame = frame_id
+    session.add(player)
+    await session.commit()
+        
+    await query.message.edit_text(
+        f"Вы выбрали рамку <b>{frame_data['name_ru']}</b>. {RESULT_EMOJIS['success']}\n"
+        f"Проверьте свой профиль с помощью /profile.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=None
+    )
+    logging.info(f"Player {player.full_name} ({player.user_id}) selected frame '{frame_id}'.")
+    await state.clear()
 
   
 async def callback_preview_frame(query: CallbackQuery, state: FSMContext):
     await query.answer()
     frame_id = query.data.split('_')[2]
 
-    with Session() as session:
-        player = ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name)
-        if not player:
-            await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            await state.clear()
-            return
+     
+    player = await ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: await и BOT_ID
+    if not player:
+        await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        await state.clear()
+        return
             
-        if frame_id not in CUSTOM_FRAMES:
-            await query.message.edit_text(f"Ошибка: Неизвестная рамка. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            await state.clear()
-            return
-        frame_data = CUSTOM_FRAMES[frame_id]
-        unlocked_frames = json.loads(player.unlocked_frames)
+    if frame_id not in CUSTOM_FRAMES:
+        await query.message.edit_text(f"Ошибка: Неизвестная рамка. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        await state.clear()
+        return
+    frame_data = CUSTOM_FRAMES[frame_id]
+    unlocked_frames = json.loads(player.unlocked_frames)
             
-        is_unlocked = (frame_id in unlocked_frames)
-        is_selected = (frame_id == player.selected_frame)
+    is_unlocked = (frame_id in unlocked_frames)
+    is_selected = (frame_id == player.selected_frame)
 
-        action_text = ""
-        action_button_text = ""
+    action_text = ""
+    action_button_text = ""
+    cost_text = ""
+
+    if is_selected:
+        action_text = "Эта рамка уже выбрана."
+        action_button_text = "? Выбрано"
+    elif is_unlocked:
+        action_text = f"Вы можете выбрать рамку <b>{frame_data['name_ru']}</b>."
+        action_button_text = "Выбрать эту рамку"
+    else:
+        price_dollars = frame_data.get('price_dollars', 0)
+        price_diamonds = frame_data.get('price_diamonds', 0.0)
         cost_text = ""
-
-        if is_selected:
-            action_text = "Эта рамка уже выбрана."
-            action_button_text = "? Выбрано"
-        elif is_unlocked:
-            action_text = f"Вы можете выбрать рамку <b>{frame_data['name_ru']}</b>."
-            action_button_text = "Выбрать эту рамку"
-        else:
-            price_dollars = frame_data.get('price_dollars', 0)
-            price_diamonds = frame_data.get('price_diamonds', 0.0)
-            cost_text = ""
-            if price_dollars > 0:
-                cost_text += f" {price_dollars}{FACTION_EMOJIS['dollars']}"
-            if price_diamonds > 0:
-                cost_text += f" {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}"
+        if price_dollars > 0:
+            cost_text += f" {price_dollars}{FACTION_EMOJIS['dollars']}"
+        if price_diamonds > 0:
+            cost_text += f" {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}"
                 
-            action_text = f"Стоимость рамки <b>{frame_data['name_ru']}</b>: {cost_text}."
-            action_button_text = f"Купить и выбрать ({cost_text.strip()})"
+        action_text = f"Стоимость рамки <b>{frame_data['name_ru']}</b>: {cost_text}."
+        action_button_text = f"Купить и выбрать ({cost_text.strip()})"
                 
             # Формируем предпросмотр профиля
             # Временно устанавливаем рамку для предпросмотра
-        original_selected_frame = player.selected_frame
-        player.selected_frame = frame_id
+    original_selected_frame = player.selected_frame
+    player.selected_frame = frame_id
             
             # Используем вспомогательную функцию для форматирования профиля, но БЕЗ кнопок
-        preview_text_parts = await _format_player_profile_text(player, session) # Нужно будет создать эту вспомогательную функцию
+    preview_text_parts = await _format_player_profile_text(player, session) # Нужно будет создать эту вспомогательную функцию
             
-        player.selected_frame = original_selected_frame # Возвращаем оригинальную рамку
+    player.selected_frame = original_selected_frame # Возвращаем оригинальную рамку
 
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=action_button_text, callback_data=f"confirm_frame_action_{frame_id}", disable_web_page_preview=True)] if not is_selected else [],
-            [InlineKeyboardButton(text="?? Назад к рамкам", callback_data="back_to_frames_list")]
-        ])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=action_button_text, callback_data=f"confirm_frame_action_{frame_id}", disable_web_page_preview=True)] if not is_selected else [],
+        [InlineKeyboardButton(text="?? Назад к рамкам", callback_data="back_to_frames_list")]
+    ])
             
-        await query.message.edit_text(
-            f"{preview_text_parts}\n\n"
-            f"{FACTION_EMOJIS['info']} {action_text}\n"
-            f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']}, {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML
-        )
-        await state.set_state(GameState.waiting_for_frame_preview_action)
-        await state.update_data(current_frame_id=frame_id) # Сохраняем ID рамки для следующего шага
+    await query.message.edit_text(
+        f"{preview_text_parts}\n\n"
+        f"{FACTION_EMOJIS['info']} {action_text}\n"
+        f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']}, {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(GameState.waiting_for_frame_preview_action)
+    await state.update_data(current_frame_id=frame_id) # Сохраняем ID рамки для следующего шага
  
 async def callback_confirm_frame_action(query: CallbackQuery, state: FSMContext):
     await query.answer()
     frame_id = query.data.split('_')[3] # confirm_frame_action_frame_id
 
-    with Session() as session:
-        player = ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name)
-        if not player:
-            await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            await state.clear()
-            return
+     
+    player = await ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: await и BOT_ID
+    if not player:
+        await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        await state.clear()
+        return
             
-        frame_data = CUSTOM_FRAMES[frame_id]
-        unlocked_frames = json.loads(player.unlocked_frames)
+    frame_data = CUSTOM_FRAMES[frame_id]
+    unlocked_frames = json.loads(player.unlocked_frames)
             
             # Логика покупки/выбора
-        if frame_id not in unlocked_frames:
+    if frame_id not in unlocked_frames:
                 # Покупка
-            price_dollars = frame_data.get('price_dollars', 0)
-            price_diamonds = frame_data.get('price_diamonds', 0.0)
+        price_dollars = frame_data.get('price_dollars', 0)
+        price_diamonds = frame_data.get('price_diamonds', 0.0)
 
-            can_afford = True
-            if price_dollars > 0 and player.dollars < price_dollars and player.user_id != BOT_OWNER_ID:
-                    can_afford = False
-            if price_diamonds > 0 and player.diamonds < price_diamonds and player.user_id != BOT_OWNER_ID:
-                    can_afford = False
+        can_afford = True
+        if price_dollars > 0 and player.dollars < price_dollars and player.user_id != BOT_OWNER_ID:
+                can_afford = False
+        if price_diamonds > 0 and player.diamonds < price_diamonds and player.user_id != BOT_OWNER_ID:
+                can_afford = False
 
-            if not can_afford:
-                await query.message.edit_text(
-                    f"У вас недостаточно средств, чтобы купить рамку <b>{frame_data['name_ru']}</b>. "
-                    f"Требуется: {price_dollars}{FACTION_EMOJIS['dollars']} и {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}.\n"
-                    f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']} и {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="?? Назад к рамкам", callback_data="back_to_frames_list")]])
-                )
-                await state.clear() # Можно вернуться к списку, а не сразу очищать FSM
-                return
-
-                # Списываем средства
-            if player.user_id != BOT_OWNER_ID:
-                player.dollars -= price_dollars
-                player.diamonds -= price_diamonds
-                
-            unlocked_frames.append(frame_id)
-            player.unlocked_frames = json.dumps(unlocked_frames)
-            session.add(player)
-            session.commit()
-                
-            current_dollars_display = "?" if player.user_id == BOT_OWNER_ID else str(player.dollars)
-            current_diamonds_display = "?" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
-                
+        if not can_afford:
             await query.message.edit_text(
-                f"Вы купили и выбрали рамку <b>{frame_data['name_ru']}</b>! {RESULT_EMOJIS['success']}\n"
-                f"Текущий баланс: {current_dollars_display}{FACTION_EMOJIS['dollars']}, {current_diamonds_display}{FACTION_EMOJIS['diamonds']}.",
+                f"У вас недостаточно средств, чтобы купить рамку <b>{frame_data['name_ru']}</b>. "
+                f"Требуется: {price_dollars}{FACTION_EMOJIS['dollars']} и {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}.\n"
+                f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']} и {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="?? Назад к рамкам", callback_data="back_to_frames_list")]])
-                )
-            logging.info(f"Player {player.full_name} ({player.user_id}) bought and selected frame '{frame_id}'.")
+            )
             await state.clear() # Можно вернуться к списку, а не сразу очищать FSM
             return
 
-            # Если рамка уже разблокирована, просто выбираем её
-        player.selected_frame = frame_id
+                # Списываем средства
+        if player.user_id != BOT_OWNER_ID:
+            player.dollars -= price_dollars
+            player.diamonds -= price_diamonds
+                
+        unlocked_frames.append(frame_id)
+        player.unlocked_frames = json.dumps(unlocked_frames)
         session.add(player)
-        session.commit()
-            
+        await session.commit()
+                
+        current_dollars_display = "?" if player.user_id == BOT_OWNER_ID else str(player.dollars)
+        current_diamonds_display = "?" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
+                
         await query.message.edit_text(
-            f"Вы выбрали рамку <b>{frame_data['name_ru']}</b>. {RESULT_EMOJIS['success']}\n"
-            f"Проверьте свой профиль с помощью /profile.",
+            f"Вы купили и выбрали рамку <b>{frame_data['name_ru']}</b>! {RESULT_EMOJIS['success']}\n"
+            f"Текущий баланс: {current_dollars_display}{FACTION_EMOJIS['dollars']}, {current_diamonds_display}{FACTION_EMOJIS['diamonds']}.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="?? Назад к рамкам", callback_data="back_to_frames_list")]])
-        )
-        logging.info(f"Player {player.full_name} ({player.user_id}) selected frame '{frame_id}'.")
+            )
+        logging.info(f"Player {player.full_name} ({player.user_id}) bought and selected frame '{frame_id}'.")
         await state.clear() # Можно вернуться к списку, а не сразу очищать FSM
+        return
+
+            # Если рамка уже разблокирована, просто выбираем её
+    player.selected_frame = frame_id
+    session.add(player)
+    await session.commit()
+            
+    await query.message.edit_text(
+        f"Вы выбрали рамку <b>{frame_data['name_ru']}</b>. {RESULT_EMOJIS['success']}\n"
+        f"Проверьте свой профиль с помощью /profile.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="?? Назад к рамкам", callback_data="back_to_frames_list")]])
+    )
+    logging.info(f"Player {player.full_name} ({player.user_id}) selected frame '{frame_id}'.")
+    await state.clear() # Можно вернуться к списку, а не сразу очищать FSM
 
 # --- Хэндлеры для кастомизации профиля (Титулы) ---
  
 async def callback_select_title_prompt(query: CallbackQuery, state: FSMContext):
     await query.answer()
-    with Session() as session:
-        player = ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name)
-        if not player:
-            await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            return
+     
+    player = await ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: await и BOT_ID
+    if not player:
+        await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        return
 
-        unlocked_titles = json.loads(player.unlocked_titles)
-        
-        keyboard_buttons = []
-        for title_id, title_data in CUSTOM_TITLES.items():
-            is_selected = (title_id == player.selected_title)
-            is_unlocked = (title_id in unlocked_titles)
+    unlocked_titles = json.loads(player.unlocked_titles)
+    
+    keyboard_buttons = []
+    for title_id, title_data in CUSTOM_TITLES.items():
+        is_selected = (title_id == player.selected_title)
+        is_unlocked = (title_id in unlocked_titles)
             
-            button_text = f"{title_data['emoji']} {title_data['name_ru']}" # Убрал лишние '???'
-            if is_selected:
-                button_text += " (Выбрано)"
-            elif not is_unlocked:
-                price_dollars = title_data.get('price_dollars', 0)
-                price_diamonds = title_data.get('price_diamonds', 0.0)
-                if price_dollars > 0:
-                    button_text += f" ({price_dollars}{FACTION_EMOJIS['dollars']})"
-                if price_diamonds > 0:
-                    button_text += f" ({price_diamonds:.1f}{FACTION_EMOJIS['diamonds']})"
+        button_text = f"{title_data['emoji']} {title_data['name_ru']}" # Убрал лишние '???'
+        if is_selected:
+            button_text += " (Выбрано)"
+        elif not is_unlocked:
+            price_dollars = title_data.get('price_dollars', 0)
+            price_diamonds = title_data.get('price_diamonds', 0.0)
+            if price_dollars > 0:
+                button_text += f" ({price_dollars}{FACTION_EMOJIS['dollars']})"
+            if price_diamonds > 0:
+                button_text += f" ({price_diamonds:.1f}{FACTION_EMOJIS['diamonds']})"
             
-            keyboard_buttons.append(
-                InlineKeyboardButton(
-                    text=button_text,
-                    callback_data=f"preview_title_{title_id}" # ИЗМЕНЕНО НА ПРЕДПРОСМОТР
-                )
+        keyboard_buttons.append(
+            InlineKeyboardButton(
+                text=button_text,
+                callback_data=f"preview_title_{title_id}" # ИЗМЕНЕНО НА ПРЕДПРОСМОТР
             )
-
-        inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            keyboard_buttons[i:i + 1] for i in range(0, len(keyboard_buttons), 1)
-        ] + [[InlineKeyboardButton(text="?? Назад в профиль", callback_data="back_to_profile")]]) # ДОБАВЛЕНА КНОПКА НАЗАД
-        
-        is_owner = (query.from_user.id == BOT_OWNER_ID)
-        dollars_display = "?" if is_owner else str(player.dollars)
-        diamonds_display = "?" if is_owner else f"{player.diamonds:.2f}"
-
-        await query.message.edit_text(
-            f"Выберите титул для вашего профиля. У вас {dollars_display}{FACTION_EMOJIS['dollars']} и {diamonds_display}{FACTION_EMOJIS['diamonds']}.",
-            reply_markup=inline_keyboard,
-            parse_mode=ParseMode.HTML
         )
-        await state.set_state(GameState.waiting_for_title_selection) # Состояние выбора (чтобы ловить preview_title_)
-async def _format_player_profile_text(player_data: Player, session) -> str:
+
+    inline_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        keyboard_buttons[i:i + 1] for i in range(0, len(keyboard_buttons), 1)
+    ] + [[InlineKeyboardButton(text="?? Назад в профиль", callback_data="back_to_profile")]]) # ДОБАВЛЕНА КНОПКА НАЗАД
+        
+    is_owner = (query.from_user.id == BOT_OWNER_ID)
+    dollars_display = "?" if is_owner else str(player.dollars)
+    diamonds_display = "?" if is_owner else f"{player.diamonds:.2f}"
+
+    await query.message.edit_text(
+        f"Выберите титул для вашего профиля. У вас {dollars_display}{FACTION_EMOJIS['dollars']} и {diamonds_display}{FACTION_EMOJIS['diamonds']}.",
+        reply_markup=inline_keyboard,
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(GameState.waiting_for_title_selection) # Состояние выбора (чтобы ловить preview_title_)
+async def _format_player_profile_text(player_data: Player, session: AsyncSession) -> str:
     """
     Формирует только текстовую часть профиля игрока для предпросмотра.
     player_data здесь - это ГЛОБАЛЬНЫЙ ПРОФИЛЬ (game_id=None).
@@ -3750,7 +3810,7 @@ async def _format_player_profile_text(player_data: Player, session) -> str:
 
     group_info_text = ""
     if player_data.last_played_group_id:
-        group_obj = session.get(Group, player_data.last_played_group_id)
+        group_obj = await session.get(Group, player_data.last_played_group_id)
         if group_obj:
             group_info_text = f"<b>{format_group_info(group_obj)}</b>"
         
@@ -3784,156 +3844,155 @@ async def _format_player_profile_text(player_data: Player, session) -> str:
         f"<code>{divider_bottom}</code>"
     )
     return profile_text
- 
 async def callback_preview_title(query: CallbackQuery, state: FSMContext):
     await query.answer()
     title_id = query.data.split('_')[2]
 
-    with Session() as session:
-        player = ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name)
-        if not player:
-            await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            await state.clear()
-            return
+     
+    player = await ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: await и BOT_ID
+    if not player:
+        await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        await state.clear()
+        return
             
-        if title_id not in CUSTOM_TITLES:
-            await query.message.edit_text(f"Ошибка: Неизвестный титул. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            await state.clear()
-            return
+    if title_id not in CUSTOM_TITLES:
+        await query.message.edit_text(f"Ошибка: Неизвестный титул. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        await state.clear()
+        return
 
-        title_data = CUSTOM_TITLES[title_id]
-        unlocked_titles = json.loads(player.unlocked_titles)
+    title_data = CUSTOM_TITLES[title_id]
+    unlocked_titles = json.loads(player.unlocked_titles)
             
-        is_unlocked = (title_id in unlocked_titles)
-        is_selected = (title_id == player.selected_title)
+    is_unlocked = (title_id in unlocked_titles)
+    is_selected = (title_id == player.selected_title)
 
-        action_text = ""
-        action_button_text = ""
+    action_text = ""
+    action_button_text = ""
+    cost_text = ""
+
+    if is_selected:
+        action_text = "Этот титул уже выбран."
+        action_button_text = " Выбрано"
+    elif is_unlocked:
+        action_text = f"Вы можете выбрать титул <b>{title_data['name_ru']}</b>."
+        action_button_text = "Выбрать этот титул"
+    else:
+        price_dollars = title_data.get('price_dollars', 0)
+        price_diamonds = title_data.get('price_diamonds', 0.0)
         cost_text = ""
-
-        if is_selected:
-            action_text = "Этот титул уже выбран."
-            action_button_text = " Выбрано"
-        elif is_unlocked:
-            action_text = f"Вы можете выбрать титул <b>{title_data['name_ru']}</b>."
-            action_button_text = "Выбрать этот титул"
-        else:
-            price_dollars = title_data.get('price_dollars', 0)
-            price_diamonds = title_data.get('price_diamonds', 0.0)
-            cost_text = ""
-            if price_dollars > 0:
-                cost_text += f" {price_dollars}{FACTION_EMOJIS['dollars']}"
-            if price_diamonds > 0:
-                cost_text += f" {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}"
+        if price_dollars > 0:
+            cost_text += f" {price_dollars}{FACTION_EMOJIS['dollars']}"
+        if price_diamonds > 0:
+            cost_text += f" {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}"
             
-            action_text = f"Стоимость титула <b>{title_data['name_ru']}</b>: {cost_text}."
-            action_button_text = f"Купить и выбрать ({cost_text.strip()})"
+        action_text = f"Стоимость титула <b>{title_data['name_ru']}</b>: {cost_text}."
+        action_button_text = f"Купить и выбрать ({cost_text.strip()})"
                 
         # Формируем предпросмотр профиля
         # Временно устанавливаем титул для предпросмотра
-        original_selected_title = player.selected_title
-        player.selected_title = title_id
+    original_selected_title = player.selected_title
+    player.selected_title = title_id
         
         # Используем вспомогательную функцию для форматирования профиля, но БЕЗ кнопок
-        preview_text_parts = await _format_player_profile_text(player, session)
+    preview_text_parts = await _format_player_profile_text(player, session)
         
-        player.selected_title = original_selected_title # Возвращаем оригинальный титул
+    player.selected_title = original_selected_title # Возвращаем оригинальный титул
 
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=action_button_text, callback_data=f"confirm_title_action_{title_id}", disable_web_page_preview=True)] if not is_selected else [],
-            [InlineKeyboardButton(text="?? Назад к титулам", callback_data="back_to_titles_list")]
-        ])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=action_button_text, callback_data=f"confirm_title_action_{title_id}", disable_web_page_preview=True)] if not is_selected else [],
+        [InlineKeyboardButton(text="?? Назад к титулам", callback_data="back_to_titles_list")]
+    ])
         
-        await query.message.edit_text(
-            f"{preview_text_parts}\n\n"
-            f"{FACTION_EMOJIS['info']} {action_text}\n"
-            f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']}, {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML
-        )
-        await state.set_state(GameState.waiting_for_title_preview_action)
-        await state.update_data(current_title_id=title_id) # Сохраняем ID титула для следующего шага
+    await query.message.edit_text(
+        f"{preview_text_parts}\n\n"
+        f"{FACTION_EMOJIS['info']} {action_text}\n"
+        f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']}, {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(GameState.waiting_for_title_preview_action)
+    await state.update_data(current_title_id=title_id) # Сохраняем ID титула для следующего шага
   
 async def callback_confirm_title_action(query: CallbackQuery, state: FSMContext):
     await query.answer()
     title_id = query.data.split('_')[3] # confirm_title_action_title_id
 
-    with Session() as session:
-        player = ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name)
-        if not player:
-            await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            await state.clear()
-            return
+     
+    player = await ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name, BOT_ID) # <--- ИСПРАВЛЕНИЕ: await и BOT_ID
+    if not player:
+        await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        await state.clear()
+        return
             
-        title_data = CUSTOM_TITLES[title_id]
-        unlocked_titles = json.loads(player.unlocked_titles)
+    title_data = CUSTOM_TITLES[title_id]
+    unlocked_titles = json.loads(player.unlocked_titles)
             
         # Логика покупки/выбора
-        if title_id not in unlocked_titles:
+    if title_id not in unlocked_titles:
             # Покупка
-            price_dollars = title_data.get('price_dollars', 0)
-            price_diamonds = title_data.get('price_diamonds', 0.0)
+        price_dollars = title_data.get('price_dollars', 0)
+        price_diamonds = title_data.get('price_diamonds', 0.0)
 
-            can_afford = True
-            if price_dollars > 0 and player.dollars < price_dollars and player.user_id != BOT_OWNER_ID:
-                can_afford = False
-            if price_diamonds > 0 and player.diamonds < price_diamonds and player.user_id != BOT_OWNER_ID:
-                can_afford = False
+        can_afford = True
+        if price_dollars > 0 and player.dollars < price_dollars and player.user_id != BOT_OWNER_ID:
+            can_afford = False
+        if price_diamonds > 0 and player.diamonds < price_diamonds and player.user_id != BOT_OWNER_ID:
+            can_afford = False
 
-            if not can_afford:
-                await query.message.edit_text(
-                    f"У вас недостаточно средств, чтобы купить титул <b>{title_data['name_ru']}</b>. "
-                    f"Требуется: {price_dollars}{FACTION_EMOJIS['dollars']} и {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}.\n"
-                    f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']} и {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="?? Назад к титулам", callback_data="back_to_titles_list")]])
-                )
-                # await state.clear() # Можно вернуться к списку, а не сразу очищать FSM
-                return
-
-            # Списываем средства
-            if player.user_id != BOT_OWNER_ID:
-                player.dollars -= price_dollars
-                player.diamonds -= price_diamonds
-            
-            unlocked_titles.append(title_id)
-            player.unlocked_titles = json.dumps(unlocked_titles)
-            session.add(player)
-            session.commit()
-            
-            current_dollars_display = "?" if player.user_id == BOT_OWNER_ID else str(player.dollars)
-            current_diamonds_display = "?" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
-            
+        if not can_afford:
             await query.message.edit_text(
-                f"Вы купили и выбрали титул <b>{title_data['name_ru']}</b>! {RESULT_EMOJIS['success']}\n"
-                f"Текущий баланс: {current_dollars_display}{FACTION_EMOJIS['dollars']}, {current_diamonds_display}{FACTION_EMOJIS['diamonds']}.",
+                f"У вас недостаточно средств, чтобы купить титул <b>{title_data['name_ru']}</b>. "
+                f"Требуется: {price_dollars}{FACTION_EMOJIS['dollars']} и {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}.\n"
+                f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']} и {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="?? Назад к титулам", callback_data="back_to_titles_list")]])
             )
-            logging.info(f"Player {player.full_name} ({player.user_id}) bought and selected title '{title_id}'.")
-            # await state.clear() # Можно вернуться к списку, а не сразу очищать FSM
+                # await state.clear() # Можно вернуться к списку, а не сразу очищать FSM
             return
 
-        # Если титул уже разблокирован, просто выбираем его
-        player.selected_title = title_id
+            # Списываем средства
+        if player.user_id != BOT_OWNER_ID:
+            player.dollars -= price_dollars
+            player.diamonds -= price_diamonds
+            
+        unlocked_titles.append(title_id)
+        player.unlocked_titles = json.dumps(unlocked_titles)
         session.add(player)
-        session.commit()
-        
+        await session.commit()
+            
+        current_dollars_display = "?" if player.user_id == BOT_OWNER_ID else str(player.dollars)
+        current_diamonds_display = "?" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
+            
         await query.message.edit_text(
-            f"Вы выбрали титул <b>{title_data['name_ru']}</b>. {RESULT_EMOJIS['success']}\n"
-            f"Проверьте свой профиль с помощью /profile.",
+            f"Вы купили и выбрали титул <b>{title_data['name_ru']}</b>! {RESULT_EMOJIS['success']}\n"
+            f"Текущий баланс: {current_dollars_display}{FACTION_EMOJIS['dollars']}, {current_diamonds_display}{FACTION_EMOJIS['diamonds']}.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="?? Назад к титулам", callback_data="back_to_titles_list")]])
         )
-        logging.info(f"Player {player.full_name} ({player.user_id}) selected title '{title_id}'.")
+        logging.info(f"Player {player.full_name} ({player.user_id}) bought and selected title '{title_id}'.")
+            # await state.clear() # Можно вернуться к списку, а не сразу очищать FSM
+        return
+
+        # Если титул уже разблокирован, просто выбираем его
+    player.selected_title = title_id
+    session.add(player)
+    await session.commit()
+        
+    await query.message.edit_text(
+        f"Вы выбрали титул <b>{title_data['name_ru']}</b>. {RESULT_EMOJIS['success']}\n"
+        f"Проверьте свой профиль с помощью /profile.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="?? Назад к титулам", callback_data="back_to_titles_list")]])
+    )
+    logging.info(f"Player {player.full_name} ({player.user_id}) selected title '{title_id}'.")
         # await state.clear() # Можно вернуться к списку, а не сразу очищать FSM    
  
 async def callback_back_to_profile(query: CallbackQuery, state: FSMContext):
     await query.answer()
-    with Session() as session:
-        player_data = ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name)
-        await display_player_profile(query.message, player_data) # query.message - это объект Message, который будет изменен
-        await state.clear()
+     
+    player_data = await ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name, BOT_ID)
+    await display_player_profile(query.message, player_data, session) # query.message - это объект Message, который будет изменен
+    await state.clear()
 
  
 async def callback_back_to_frames_list(query: CallbackQuery, state: FSMContext):
@@ -3951,171 +4010,178 @@ async def callback_select_title(query: CallbackQuery, state: FSMContext):
     await query.answer()
     title_id = query.data.split('_')[2]
 
-    with Session() as session:
-        player = ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name)
-        if not player:
-            await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            await state.clear()
-            return
+     
+    player = await ensure_player_profile_exists(session, query.from_user.id, query.from_user.username, query.from_user.full_name, BOT_ID)
+    if not player:
+        await query.message.edit_text(f"Ошибка: Не удалось загрузить ваш профиль. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        await state.clear()
+        return
         
-        if title_id not in CUSTOM_TITLES:
-            await query.message.edit_text(f"Ошибка: Неизвестный титул. {FACTION_EMOJIS['missed']}", reply_markup=None)
-            await state.clear()
-            return
+    if title_id not in CUSTOM_TITLES:
+        await query.message.edit_text(f"Ошибка: Неизвестный титул. {FACTION_EMOJIS['missed']}", reply_markup=None)
+        await state.clear()
+        return
         
-        title_data = CUSTOM_TITLES[title_id]
-        unlocked_titles = json.loads(player.unlocked_titles)
+    title_data = CUSTOM_TITLES[title_id]
+    unlocked_titles = json.loads(player.unlocked_titles)
         
-        if title_id not in unlocked_titles:
+    if title_id not in unlocked_titles:
             # Попытка купить титул
-            price_dollars = title_data.get('price_dollars', 0)
-            price_diamonds = title_data.get('price_diamonds', 0.0)
+        price_dollars = title_data.get('price_dollars', 0)
+        price_diamonds = title_data.get('price_diamonds', 0.0)
 
-            can_afford = True
-            if price_dollars > 0 and player.dollars < price_dollars and player.user_id != BOT_OWNER_ID:
-                can_afford = False
-            if price_diamonds > 0 and player.diamonds < price_diamonds and player.user_id != BOT_OWNER_ID:
-                can_afford = False
+        can_afford = True
+        if price_dollars > 0 and player.dollars < price_dollars and player.user_id != BOT_OWNER_ID:
+            can_afford = False
+        if price_diamonds > 0 and player.diamonds < price_diamonds and player.user_id != BOT_OWNER_ID:
+            can_afford = False
 
-            if not can_afford:
-                await query.message.edit_text(
-                    f"У вас недостаточно средств, чтобы купить титул <b>{title_data['name_ru']}</b>. "
-                    f"Требуется: {price_dollars}{FACTION_EMOJIS['dollars']} и {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}.\n"
-                    f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']} и {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=None
-                )
-                await state.clear()
-                return
-
-            # Списываем средства
-            if player.user_id != BOT_OWNER_ID:
-                player.dollars -= price_dollars
-                player.diamonds -= price_diamonds
-            
-            unlocked_titles.append(title_id)
-            player.unlocked_titles = json.dumps(unlocked_titles)
-            session.add(player)
-            session.commit()
-            
-            current_dollars_display = "?" if player.user_id == BOT_OWNER_ID else str(player.dollars)
-            current_diamonds_display = "?" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
+        if not can_afford:
             await query.message.edit_text(
-                f"Вы купили и выбрали титул <b>{title_data['name_ru']}</b>! {RESULT_EMOJIS['success']}\n"
-                f"Текущий баланс: {current_dollars_display}{FACTION_EMOJIS['dollars']}, {current_diamonds_display}{FACTION_EMOJIS['diamonds']}.",
+                f"У вас недостаточно средств, чтобы купить титул <b>{title_data['name_ru']}</b>. "
+                f"Требуется: {price_dollars}{FACTION_EMOJIS['dollars']} и {price_diamonds:.1f}{FACTION_EMOJIS['diamonds']}.\n"
+                f"Ваш баланс: {player.dollars}{FACTION_EMOJIS['dollars']} и {player.diamonds:.2f}{FACTION_EMOJIS['diamonds']}.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=None
             )
-            logging.info(f"Player {player.full_name} ({player.user_id}) bought and selected title '{title_id}'.")
             await state.clear()
             return
 
-        # Если титул уже разблокирован, просто выбираем его
-        player.selected_title = title_id
+            # Списываем средства
+        if player.user_id != BOT_OWNER_ID:
+            player.dollars -= price_dollars
+            player.diamonds -= price_diamonds
+            
+        unlocked_titles.append(title_id)
+        player.unlocked_titles = json.dumps(unlocked_titles)
         session.add(player)
-        session.commit()
-        
+        await session.commit()
+            
+        current_dollars_display = "?" if player.user_id == BOT_OWNER_ID else str(player.dollars)
+        current_diamonds_display = "?" if player.user_id == BOT_OWNER_ID else f"{player.diamonds:.2f}"
         await query.message.edit_text(
-            f"Вы выбрали титул <b>{title_data['name_ru']}</b>. {RESULT_EMOJIS['success']}\n"
-            f"Проверьте свой профиль с помощью /profile.",
+            f"Вы купили и выбрали титул <b>{title_data['name_ru']}</b>! {RESULT_EMOJIS['success']}\n"
+            f"Текущий баланс: {current_dollars_display}{FACTION_EMOJIS['dollars']}, {current_diamonds_display}{FACTION_EMOJIS['diamonds']}.",
             parse_mode=ParseMode.HTML,
             reply_markup=None
         )
-        logging.info(f"Player {player.full_name} ({player.user_id}) selected title '{title_id}'.")
+        logging.info(f"Player {player.full_name} ({player.user_id}) bought and selected title '{title_id}'.")
         await state.clear()
+        return
+
+        # Если титул уже разблокирован, просто выбираем его
+    player.selected_title = title_id
+    session.add(player)
+    await session.commit()
+        
+    await query.message.edit_text(
+        f"Вы выбрали титул <b>{title_data['name_ru']}</b>. {RESULT_EMOJIS['success']}\n"
+        f"Проверьте свой профиль с помощью /profile.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=None
+    )
+    logging.info(f"Player {player.full_name} ({player.user_id}) selected title '{title_id}'.")
+    await state.clear()
  
-async def process_farewell_message(message: Message, state: FSMContext):
-    with Session() as session:
-        try:
-            user_id = message.from_user.id
-            data = await state.get_data()
-            game_id = data.get('game_id')
-            player_full_name = data.get('player_full_name')
-            player_role = data.get('player_role')
+async def process_farewell_message(message: Message, state: FSMContext, session: AsyncSession):
+     
+    try:
+        user_id = message.from_user.id
+        data = await state.get_data()
+        game_id = data.get('game_id')
+        player_full_name = data.get('player_full_name')
+        player_role = data.get('player_role')
 
-            game = session.get(Game, game_id)
-            if not game or game.status == 'finished' or game.status == 'cancelled':
-                await message.reply(f"Игра, в которой вы погибли, уже завершена или отменена. Ваше прощальное сообщение не будет отправлено. {PHASE_EMOJIS['death']}")
-                await state.clear()
-                return
-
-            player_obj = session.query(Player).filter_by(user_id=user_id, game_id=game_id).first()
-            if not player_obj or player_obj.is_alive:
-                await message.reply(
-                    f"Что-то пошло не так. Вы не мертвы в этой игре или игра не найдена. Ваше сообщение не отправлено. {PHASE_EMOJIS['death']}")
-                await state.clear()
-                return
-
-            role_emoji = ROLE_EMOJIS.get(player_role, "?")
-            player_role_ru = ROLE_NAMES_RU.get(player_role, player_role.capitalize())
-
-            farewell_text = (
-                f"{PHASE_EMOJIS['death']} Из жителей <a href='tg://user?id={user_id}'><b>{player_full_name}</b></a> "
-                f"({role_emoji} {player_role_ru}), перед смертью услышали его крики:\n\n"
-                f"<i>{message.text}</i>"
-            )
-            await bot.send_message(chat_id=game.chat_id, text=farewell_text, parse_mode=ParseMode.HTML)
-            await message.reply(f"Ваше прощальное сообщение отправлено в чат игры {PHASE_EMOJIS['death']}")
-            logging.info(f"Player {player_full_name} ({user_id}) sent farewell message to game {game_id}.")
+        game = await session.get(Game, game_id)
+        if not game or game.status == 'finished' or game.status == 'cancelled':
+            await message.reply(f"Игра, в которой вы погибли, уже завершена или отменена. Ваше прощальное сообщение не будет отправлено. {PHASE_EMOJIS['death']}")
             await state.clear()
+            return
 
-        except Exception as e:
-            logging.error(f"Ошибка при обработке прощального сообщения от {message.from_user.id}: {e}", exc_info=True)
-            await message.reply(f"Произошла ошибка при отправке вашего прощального сообщения. {PHASE_EMOJIS['death']}")
+        player_obj_result = await session.execute(
+            select(Player).filter_by(user_id=user_id, game_id=game_id)
+        )
+        player_obj = player_obj_result.scalars().first()
+        if not player_obj or player_obj.is_alive:
+            await message.reply(
+                f"Что-то пошло не так. Вы не мертвы в этой игре или игра не найдена. Ваше сообщение не отправлено. {PHASE_EMOJIS['death']}")
             await state.clear()
-            session.rollback()
+            return
 
+        role_emoji = ROLE_EMOJIS.get(player_role, "?")
+        player_role_ru = ROLE_NAMES_RU.get(player_role, player_role.capitalize())
+
+        farewell_text = (
+            f"{PHASE_EMOJIS['death']} Из жителей <a href='tg://user?id={user_id}'><b>{player_full_name}</b></a> "
+            f"({role_emoji} {player_role_ru}), перед смертью услышали его крики:\n\n"
+            f"<i>{message.text}</i>"
+        )
+        await bot.send_message(chat_id=game.chat_id, text=farewell_text, parse_mode=ParseMode.HTML)
+        await message.reply(f"Ваше прощальное сообщение отправлено в чат игры {PHASE_EMOJIS['death']}")
+        logging.info(f"Player {player_full_name} ({user_id}) sent farewell message to game {game_id}.")
+        await state.clear()
+
+    except Exception as e:
+        logging.error(f"Ошибка при обработке прощального сообщения от {message.from_user.id}: {e}", exc_info=True)
+        await message.reply(f"Произошла ошибка при отправке вашего прощального сообщения. {FACTION_EMOJIS['death']}")
+        await state.clear()
+        await session.rollback() # <-- ИЗМЕНИЛИ
 
  
-async def handle_faction_message(message: Message, state: FSMContext):
-    with Session() as session:
-        try:
-            user_id = message.from_user.id
-            data = await state.get_data()
-            game_id = data.get('game_id')
-            player_full_name = data.get('player_full_name')
-            player_role = data.get('player_role')
+async def handle_faction_message(message: Message, state: FSMContext, session: AsyncSession):
+     
+    try:
+        user_id = message.from_user.id
+        data = await state.get_data()
+        game_id = data.get('game_id')
+        player_full_name = data.get('player_full_name')
+        player_role = data.get('player_role')
 
-            game = session.get(Game, game_id)
-            player = session.query(Player).filter_by(user_id=user_id, game_id=game_id, is_alive=True).first()
-            if not game or not player or game.status != 'playing' or game.phase != 'night' or player.role not in ['mafia', 'don']:
-                await message.reply("Вы не можете отправлять сообщения в чат фракции сейчас (игра не активна, не ночь, или вы не в мафии/мертвы).")
-                await state.clear()
-                return
+        game = await session.get(Game, game_id)
+        player_result = await session.execute(
+            select(Player).filter_by(user_id=user_id, game_id=game_id, is_alive=True)
+        )
+        player = player_result.scalars().first()
+        if not game or not player or game.status != 'playing' or game.phase != 'night' or player.role not in ['mafia', 'don']:
+            await message.reply("Вы не можете отправлять сообщения в чат фракции сейчас (игра не активна, не ночь, или вы не в мафии/мертвы).")
+            await state.clear()
+            return
 
-            allies = session.query(Player).filter(
+        allies_result = await session.execute(
+            select(Player).filter(
                 Player.game_id == game.id,
                 Player.is_alive == True,
                 Player.role.in_(['mafia', 'don']),
                 Player.user_id != user_id
-            ).all()
+            )
+        )
+        allies = allies_result.scalars().all()
 
-            role_emoji = ROLE_EMOJIS.get(player.role, "?")
-            chat_message = f"{role_emoji} <b>{player_full_name}</b>: {message.text}"
+        role_emoji = ROLE_EMOJIS.get(player.role, "?")
+        chat_message = f"{role_emoji} <b>{player_full_name}</b>: {message.text}"
 
-            for ally in allies:
-                try:
-                    await bot.send_message(chat_id=ally.user_id, text=chat_message, parse_mode=ParseMode.HTML)
-                except TelegramForbiddenError:
-                    logging.warning(f"Бот заблокирован союзником {ally.full_name}: не удалось отправить сообщение фракции.")
-                except Exception as e:
-                    logging.error(f"Ошибка при отправке сообщения фракции союзнику {ally.full_name}: {e}", exc_info=True)
-            
-            await state.set_state(GameState.waiting_for_faction_message)
+        for ally in allies:
+            try:
+                await bot.send_message(chat_id=ally.user_id, text=chat_message, parse_mode=ParseMode.HTML)
+            except TelegramForbiddenError:
+                logging.warning(f"Бот заблокирован союзником {ally.full_name}: не удалось отправить сообщение фракции.")
+            except Exception as e:
+                logging.error(f"Ошибка при отправке сообщения фракции союзнику {ally.full_name}: {e}", exc_info=True)
+        
+        await state.set_state(GameState.waiting_for_faction_message)
 
-        except Exception as e:
-            logging.error(f"Ошибка при обработке сообщения фракции от {user_id}: {e}", exc_info=True)
-            await message.reply(f"Произошла ошибка при отправке сообщения. {FACTION_EMOJIS['missed']}")
-            await state.clear()
-            session.rollback()
-
+    except Exception as e:
+        logging.error(f"Ошибка при обработке сообщения фракции от {user_id}: {e}", exc_info=True)
+        await message.reply(f"Произошла ошибка при отправке сообщения. {FACTION_EMOJIS['missed']}")
+        await state.clear()
+        await session.rollback() # <-- ИЗМЕНИЛИ
  
-async def delete_non_game_messages(message: Message):
+async def delete_non_game_messages(message: Message, session: AsyncSession):
     # 0. Сообщения от самого бота никогда не удаляем
     if bot_self_info and message.from_user.id == bot_self_info.id:
         return
 
-    with Session() as session:
+ 
         try:
             # 1. Любые команды (начинающиеся с '/') всегда разрешены
             if message.text and message.text.startswith('/'):
@@ -4146,11 +4212,9 @@ async def delete_non_game_messages(message: Message):
                     logging.error(f"Error checking admin or editing dot message in chat {message.chat.id}: {e}", exc_info=True)
 
 
-            session.expire_all()
-            logging.debug(f"DEBUG: Session cache expired for chat {message.chat.id}.")
-
-            game = session.query(Game).filter(Game.chat_id == message.chat.id).first()
-
+            await session.expire_all() # <-- ИЗМЕНИЛИ
+            game_result = await session.execute(select(Game).filter(Game.chat_id == message.chat.id)) # <-- ИЗМЕНИЛИ
+            game = game_result.scalars().first() # <-- ИЗМЕНИЛИ
             if not game:
                 logging.info(f"INFO: No game found for chat {message.chat.id}. Message from {message.from_user.full_name} (ID: {message.from_user.id}) PASSED THROUGH delete handler (no game).")
                 return
@@ -4165,8 +4229,8 @@ async def delete_non_game_messages(message: Message):
                 return
 
             if game.status == 'playing':
-                player = session.query(Player).filter_by(user_id=message.from_user.id, game_id=game.id).first()
-
+                result_player = await session.execute(select(Player).filter_by(user_id=message.from_user.id, game_id=game.id))
+                player = result_player.scalars().first()
                 if not player or not player.is_alive:
                     await message.delete()
                     logging.info(f"ACTION: Deleted message from non-player/dead player {message.from_user.full_name} (ID: {message.from_user.id}) in game {game.id} (status: {game.status}, phase: {game.phase}).")
@@ -4206,6 +4270,8 @@ class DbSessionMiddleware(BaseMiddleware):
                 return await handler(event, data)            
 AsyncSessionLocal = None # Эту переменную вы, вероятно, создавали в database.py, но она нужна здесь для Middleware
 engine = None
+
+
 async def main():
     global bot, dp, bot_self_info, BOT_ID, AsyncSessionLocal, engine # Добавьте BOT_ID
     logging.info("--- Main function started ---")
@@ -4218,32 +4284,27 @@ async def main():
     else:
         logging.info("Not using proxy.")
 
+    aiogram_session_instance: ClientSession | None = None
     # 2. Создание ОБЪЕКТА aiohttp.ClientSession ОДИН РАЗ
-##    aiogram_session_instance = aiohttp.ClientSession(connector=connector) # Или без connector, если он не нужен
-##   
-##    # 3. Определение АСИНХРОННОЙ ВЫЗЫВАЕМОЙ ФУНКЦИИ для параметра 'session' в Bot
-##    async def custom_session_callable(bot_instance: Bot, method: TelegramMethod, timeout: int | float | None = None):
-##        # type hints добавлены для ясности
-##        if not isinstance(method, TelegramMethod):
-##             logging.error(f"custom_session_callable received unexpected method type: {type(method)}")
-##             raise TypeError(f"Expected TelegramMethod, got {type(method)}")
-##
-##        base_api_url = "https://api.telegram.org"
-##        full_url = f"{base_api_url}/bot{BOT_TOKEN}/{method.__api_method__}"
-##        payload = method.model_dump_json() # Используем model_dump_json для aiogram v3
-##        
-##        async with aiogram_session_instance.post(full_url, data=payload, headers=headers) as resp:
-##            resp.raise_for_status()
-##            json_response = await resp.json()
-##            if json_response.get('ok') and 'result' in json_response:
-##                return method._returning_._model_validate(json_response['result'])
-##            else:
-##                raise Exception(f"Telegram API error: {json_response.get('description')}")
+    try:
+        if connector:
+            aiogram_session_instance = aiohttp.ClientSession(connector=connector)
+        else:
+            aiogram_session_instance = aiohttp.ClientSession()
+        logging.info("aiohttp.ClientSession created.")
+    except Exception as e:
+        logging.error(f"Failed to create aiohttp.ClientSession: {e}", exc_info=True)
+        return # Выход, если не удалось создать сессию
+
+    # 3. Определение АСИНХРОННОЙ ВЫЗЫВАЕМОЙ ФУНКЦИИ для параметра 'session' в Bot
+    # (Это больше не нужно, aiogram 3 сам использует aiohttp.ClientSession, переданный в Bot.)
+    # Вам просто нужно передать aiogram_session_instance в Bot.
+
     # 4. Инициализация Bot
     # Получаем BOT_TOKEN и DATABASE_URL (например, из .env)
     # Убедитесь, что load_dotenv() был вызван где-то до main()
     BOT_TOKEN = os.getenv("BOT_TOKEN")
-    print(f"DEBUG: BOT_TOKEN is {{BOT_TOKEN}}") # Проверим, что токен получается
+    print(f"DEBUG: BOT_TOKEN is {BOT_TOKEN}") # Проверим, что токен получается
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./mafia_game.db")
 
     logging.info("Starting database initialization...")
@@ -4258,11 +4319,14 @@ async def main():
     # После инициализации бота и, возможно, получения информации о нем
     bot = Bot(
         token=BOT_TOKEN,
-        default_properties=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        default_properties=DefaultBotProperties(parse_mode=ParseMode.HTML),
+##        session=aiogram_session_instance # <--- ПЕРЕДАЧА СОЗДАННОЙ СЕССИИ СЮДА
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(DbSessionMiddleware(session_pool=AsyncSessionLocal))
-    # 5. Получение информации о боте (для проверки)
+    # Получаем BOT_TOKEN и DATABASE_URL (например, из .env)
+    # Убедитесь, что load_dotenv() был вызван где-то до main()
+         # 5. Получение информации о боте (для проверки)
     print("Bot and Dispatcher initialized.")
     try:
         bot_self_info = await bot.get_me()
@@ -4321,23 +4385,53 @@ async def main():
     # Регистрация FSM хэндлеров
     dp.message.register(process_farewell_message, GameState.waiting_for_farewell_message)
     dp.message.register(handle_faction_message, GameState.waiting_for_faction_message)
-    dp.callback_query.register(callback_select_donate_group, GameState.waiting_for_donate_group_selection)
+    
+    # FSM для пожертвований:
+    dp.callback_query.register(callback_select_donate_group, F.data.startswith('select_donate_group_'), GameState.waiting_for_donate_group_selection) # <--- ИЗМЕНИЛИ
+    dp.callback_query.register(callback_donate_currency_selection, F.data.startswith('donate_currency_'), GameState.waiting_for_donate_currency_selection) # <-- НОВАЯ РЕГИСТРАЦИЯ
+    dp.message.register(process_donate_dollars_amount, GameState.waiting_for_donate_dollars_amount)
+    dp.message.register(process_donate_diamonds_amount, GameState.waiting_for_donate_diamonds_amount)
 
+     # Регистрация коллбэков, которые вызывают FSM для кастомизации
+    dp.callback_query.register(callback_select_frame_prompt, F.data == "select_frame_prompt")
+    dp.callback_query.register(callback_select_title_prompt, F.data == "select_title_prompt")
+
+    # FSM для кастомизации (рамки и титулы)
+    dp.callback_query.register(callback_preview_frame, F.data.startswith('preview_frame_'), GameState.waiting_for_frame_selection)
+    dp.callback_query.register(callback_confirm_frame_action, F.data.startswith('confirm_frame_action_'), GameState.waiting_for_frame_preview_action)
+    dp.callback_query.register(callback_preview_title, F.data.startswith('preview_title_'), GameState.waiting_for_title_selection)
+    dp.callback_query.register(callback_confirm_title_action, F.data.startswith('confirm_title_action_'), GameState.waiting_for_title_preview_action)
+
+    # Кнопки "Назад"
+    dp.callback_query.register(callback_back_to_profile, F.data == 'back_to_profile', 
+        GameState.waiting_for_frame_selection, 
+        GameState.waiting_for_title_selection, 
+        GameState.waiting_for_frame_preview_action, 
+        GameState.waiting_for_title_preview_action)
+    
+    dp.callback_query.register(callback_back_to_frames_list, F.data == 'back_to_frames_list', 
+        GameState.waiting_for_frame_preview_action) # Этот хэндлер должен повторно вызвать callback_select_frame_prompt
+    
+    dp.callback_query.register(callback_back_to_titles_list, F.data == 'back_to_titles_list', 
+        GameState.waiting_for_title_preview_action) # Этот хэндлер должен повторно вызвать callback_select_title_prompt
     # Регистрация других типов хэндлеров
     dp.message.register(handle_gif, F.animation, F.chat.type == ChatType.PRIVATE)
     dp.message.register(delete_non_game_messages, F.chat.type.in_([ChatType.GROUP, ChatType.SUPERGROUP]))
 
-
      
     scheduler_needs_restart = False
-    with Session() as session: # Если scheduler использует БД
-        active_games_in_db = session.query(Game).filter(Game.status == 'playing').all()
+    # Middleware уже предоставляет сессию для обработчиков, но для логики перезапуска
+    # Scheduler нужна отдельная сессия, так как это не обработчик.
+    # Поэтому `async with AsyncSessionLocal() as session:` здесь уместен.
+    async with AsyncSessionLocal() as session:
+        result_active_games = await session.execute(select(Game).filter(Game.status == 'playing'))
+        active_games_in_db = result_active_games.scalars().all()  
         for game in active_games_in_db:
             if game.phase_end_time and game.phase_end_time > datetime.datetime.now():
                 logging.info(f"Rescheduling active game {game.id} job. Current phase: {game.phase}, next run at: {game.phase_end_time}")
                 job_id = f"end_{game.phase}_game_{game.id}" if game.phase != 'night' else f"end_night_processing_game_{game.id}"
                 if game.phase == 'day':
-                    scheduler.add_job(end_day_phase, 'date', run_date=game.phase_end_time, args=[game.id], id=job_id)
+                    scheduler.add_job(end_day_phase, 'date', run_date=game.phase_end_time, args=[game.id], id=job_id) # session не нужно здесь, так как end_day_phase сама создаст сессию
                 elif game.phase == 'voting':
                     scheduler.add_job(end_voting_phase, 'date', run_date=game.phase_end_time, args=[game.id], id=job_id)
                 elif game.phase == 'lynch_vote':
