@@ -2184,11 +2184,16 @@ async def cmd_profile(message: Message):
                 return 
             session.commit() # Сохраняем создание/обновление глобального профиля
 
+                # Здесь может произойти TelegramNetworkError при вызове display_player_profile
             await display_player_profile(message, player_data) 
             logging.info(f"Player {message.from_user.full_name} requested their profile.")
 
+        except TelegramNetworkError as e: # Добавляем это исключение
+            logging.error(f"Сетевая ошибка при получении профиля игрока {message.from_user.id}: {e}", exc_info=True)
+            await message.reply(f"Произошла сетевая ошибка при загрузке профиля. Пожалуйста, проверьте ваше интернет-соединение или попробуйте еще раз позже. {FACTION_EMOJIS['missed']}")
+            session.rollback()
         except Exception as e:
-            logging.error(f"Ошибка при получении профиля игрока {message.from_user.id}: {e}", exc_info=True)
+            logging.error(f"Общая ошибка при получении профиля игрока {message.from_user.id}: {e}", exc_info=True)
             await message.reply(f"Произошла ошибка при загрузке профиля. Попробуйте позже. {FACTION_EMOJIS['missed']}")
             session.rollback()
 async def display_player_profile(message: Message, player_data: Player):
